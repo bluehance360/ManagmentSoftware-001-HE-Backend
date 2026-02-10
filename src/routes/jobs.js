@@ -196,7 +196,7 @@ router.patch(
       const STATUS_MESSAGES = {
         CONFIRMED:   `Job "${job.title}" has been confirmed`,
         ASSIGNED:    `Job "${job.title}" has been assigned`,
-        DISPATCHED:  `Job "${job.title}" has been dispatched to you`,
+        DISPATCHED:  `Job "${job.title}" has been dispatched`,
         IN_PROGRESS: `Job "${job.title}" is now in progress`,
         COMPLETED:   `Job "${job.title}" has been completed`,
         BILLED:      `Job "${job.title}" has been billed`,
@@ -206,6 +206,8 @@ router.patch(
       if (req.body.status === JOB_STATUS.DISPATCHED && job.assignedTechnician) {
         // Notify the assigned technician
         notifRecipientIds.push(job.assignedTechnician._id || job.assignedTechnician);
+        // Also notify admins about the dispatch
+        notifRoles.push(ROLES.ADMIN);
       }
       if ([JOB_STATUS.IN_PROGRESS, JOB_STATUS.COMPLETED].includes(req.body.status)) {
         // Notify admins and managers
