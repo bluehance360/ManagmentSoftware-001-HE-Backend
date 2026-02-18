@@ -3,10 +3,13 @@
   "version": "1.0.0",
   "description": "Field Service Management API",
   "main": "src/server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "build": "pnpm install --prod",
+    "build": "pnpm install --no-frozen-lockfile",
     "seed": "node src/scripts/seed.js"
   },
   "keywords": [
