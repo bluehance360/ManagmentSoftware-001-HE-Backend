@@ -36,8 +36,9 @@ router.get('/', async (req, res) => {
         ? (techVisibleStatuses.includes(status) ? status : '__none__')
         : { $in: techVisibleStatuses };
     } else if (req.user.role === ROLES.OFFICE_MANAGER) {
-      // Managers see everything except TENTATIVE
+      // Managers see everything including TENTATIVE
       const managerVisibleStatuses = [
+        JOB_STATUS.TENTATIVE,
         JOB_STATUS.CONFIRMED,
         JOB_STATUS.ASSIGNED,
         JOB_STATUS.DISPATCHED,
@@ -92,8 +93,8 @@ router.get('/:id', async (req, res) => {
 
     if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
 
-    // TENTATIVE jobs are only visible to ADMIN
-    if (job.status === JOB_STATUS.TENTATIVE && req.user.role !== ROLES.ADMIN) {
+    // TENTATIVE jobs are visible to ADMIN and OFFICE_MANAGER
+    if (job.status === JOB_STATUS.TENTATIVE && ![ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(req.user.role)) {
       return res.status(403).json({ success: false, error: 'Not authorized to view this job' });
     }
 
@@ -119,10 +120,10 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// ── POST /api/jobs (ADMIN) ──────────────────────────────────────────
+// ── POST /api/jobs (ADMIN, OFFICE_MANAGER) ──────────────────────────
 router.post(
   '/',
-  authorize(ROLES.ADMIN),
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   [
     body('title').notEmpty().withMessage('Job title is required'),
     body('customerName').notEmpty().withMessage('Customer name is required'),
@@ -145,12 +146,12 @@ router.post(
     try {
       const job = await JobService.createJob(req.body, req.user._id);
 
-      // Notify other admins only (new jobs are TENTATIVE, managers can't see them)
+      // Notify admins and managers (managers can now see TENTATIVE jobs)
       createNotification({
         type: 'JOB_CREATED',
         message: `New job created by ${req.user.name}: "${job.title}" for ${job.customerName}`,
         jobId: job._id,
-        recipientRoles: [ROLES.ADMIN],
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,
       });
 
@@ -206,15 +207,15 @@ router.patch(
       if (req.body.status === JOB_STATUS.DISPATCHED && job.assignedTechnician) {
         // Notify the assigned technician
         notifRecipientIds.push(job.assignedTechnician._id || job.assignedTechnician);
-        // Also notify admins about the dispatch
-        notifRoles.push(ROLES.ADMIN);
+        // Also notify admins and managers about the dispatch
+        notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
       }
       if ([JOB_STATUS.IN_PROGRESS, JOB_STATUS.COMPLETED].includes(req.body.status)) {
         // Notify admins and managers
         notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
       }
       if (req.body.status === JOB_STATUS.BILLED) {
-        notifRoles.push(ROLES.ADMIN);
+        notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
       }
       if (req.body.status === JOB_STATUS.CONFIRMED) {
         notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
@@ -237,10 +238,10 @@ router.patch(
   }
 );
 
-// ── PATCH /api/jobs/:id/assign (ADMIN) ──────────────────────────────
+// ── PATCH /api/jobs/:id/assign (ADMIN, OFFICE_MANAGER) ──────────────
 router.patch(
   '/:id/assign',
-  authorize(ROLES.ADMIN),
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   [
     body('technicianId').isMongoId().withMessage('Valid technician ID required'),
     body('notes').optional().isString(),
@@ -263,13 +264,13 @@ router.patch(
         return res.status(result.status).json({ success: false, error: result.error });
       }
 
-      // Notify managers only — technician will be notified when manager dispatches
+      // Notify admins and managers — technician will be notified when dispatched
       const assignedJob = result.data;
       createNotification({
         type: 'JOB_ASSIGNED',
         message: `Job "${assignedJob.title}" has been assigned to ${assignedJob.assignedTechnician?.name || 'a technician'} by ${req.user.name}`,
         jobId: assignedJob._id,
-        recipientRoles: [ROLES.OFFICE_MANAGER],
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,
       });
 
@@ -281,10 +282,10 @@ router.patch(
   }
 );
 
-// ── PATCH /api/jobs/:id/reassign (ADMIN) ────────────────────────────
+// ── PATCH /api/jobs/:id/reassign (ADMIN, OFFICE_MANAGER) ────────────
 router.patch(
   '/:id/reassign',
-  authorize(ROLES.ADMIN),
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   [
     body('technicianId').isMongoId().withMessage('Valid technician ID required'),
     body('notes').optional().isString(),
@@ -335,12 +336,12 @@ router.patch(
       await job.populate('assignedTechnician', 'name email');
       await job.populate('createdBy', 'name email');
 
-      // Notify managers only — technician will be notified when dispatched
+      // Notify admins and managers — technician will be notified when dispatched
       createNotification({
         type: 'JOB_REASSIGNED',
         message: `Job "${job.title}" reassigned from ${oldTechName} to ${newTechName} by ${req.user.name}`,
         jobId: job._id,
-        recipientRoles: [ROLES.OFFICE_MANAGER],
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,
       });
 
@@ -352,10 +353,10 @@ router.patch(
   }
 );
 
-// ── DELETE /api/jobs/:id (ADMIN) ────────────────────────────────────
+// ── DELETE /api/jobs/:id (ADMIN, OFFICE_MANAGER) ────────────────────
 router.delete(
   '/:id',
-  authorize(ROLES.ADMIN),
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   async (req, res) => {
     try {
       const job = await Job.findById(req.params.id)
@@ -384,10 +385,8 @@ router.delete(
         notifRecipientIds.push(techId);
       }
 
-      // Only notify managers if the job was visible to them (not TENTATIVE)
-      if (job.status !== JOB_STATUS.TENTATIVE) {
-        notifRoles.push(ROLES.OFFICE_MANAGER);
-      }
+      // Notify admins and managers (both can see all jobs including TENTATIVE)
+      notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
 
       if (notifRecipientIds.length > 0 || notifRoles.length > 0) {
         createNotification({
@@ -446,12 +445,7 @@ router.put(
       // Notify relevant people based on job visibility
       const updatedJob = result.data;
       const notifRecipientIds = [];
-      const notifRoles = [ROLES.ADMIN];
-
-      // Only notify managers if the job is visible to them (not TENTATIVE)
-      if (updatedJob.status !== JOB_STATUS.TENTATIVE) {
-        notifRoles.push(ROLES.OFFICE_MANAGER);
-      }
+      const notifRoles = [ROLES.ADMIN, ROLES.OFFICE_MANAGER];
 
       // Only notify tech if the job was already dispatched to them
       const techVisible = [JOB_STATUS.DISPATCHED, JOB_STATUS.IN_PROGRESS, JOB_STATUS.COMPLETED];
