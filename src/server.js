@@ -8,6 +8,7 @@ const authRoutes = require('./routes/auth');
 const jobRoutes = require('./routes/jobs');
 const userRoutes = require('./routes/users');
 const notificationRoutes = require('./routes/notifications');
+const invitationRoutes = require('./routes/invitations');
 const { errorHandler, notFound } = require('./middleware/errorHandler');
 
 const app = express();
@@ -35,6 +36,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/jobs', jobRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/invitations', invitationRoutes);
 
 // Error handling
 app.use(notFound);
