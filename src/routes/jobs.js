@@ -5,6 +5,7 @@ const User = require('../models/User');
 const { authenticate, authorize } = require('../middleware/auth');
 const { ROLES, JOB_STATUS } = require('../config/constants');
 const JobService = require('../services/JobService');
+const Customer = require('../models/Customer');
 const { createNotification } = require('../services/NotificationService');
 const { getIO } = require('../socket');
 
@@ -25,9 +26,9 @@ router.get('/', async (req, res) => {
 
     if (req.user.role === ROLES.TECHNICIAN) {
       filter.assignedTechnician = req.user._id;
-      // Technicians only see jobs that have been dispatched to them by the manager
+      // Technicians see all assigned jobs immediately
       const techVisibleStatuses = [
-        JOB_STATUS.DISPATCHED,
+        JOB_STATUS.ASSIGNED,
         JOB_STATUS.IN_PROGRESS,
         JOB_STATUS.COMPLETED,
         JOB_STATUS.BILLED,
@@ -41,7 +42,6 @@ router.get('/', async (req, res) => {
         JOB_STATUS.TENTATIVE,
         JOB_STATUS.CONFIRMED,
         JOB_STATUS.ASSIGNED,
-        JOB_STATUS.DISPATCHED,
         JOB_STATUS.IN_PROGRESS,
         JOB_STATUS.COMPLETED,
         JOB_STATUS.BILLED,
@@ -98,10 +98,10 @@ router.get('/:id', async (req, res) => {
       return res.status(403).json({ success: false, error: 'Not authorized to view this job' });
     }
 
-    // Technicians can only see DISPATCHED+ jobs (not ASSIGNED/CONFIRMED)
+    // Technicians can only see ASSIGNED+ jobs
     if (req.user.role === ROLES.TECHNICIAN) {
       const techVisibleStatuses = [
-        JOB_STATUS.DISPATCHED,
+        JOB_STATUS.ASSIGNED,
         JOB_STATUS.IN_PROGRESS,
         JOB_STATUS.COMPLETED,
         JOB_STATUS.BILLED,
@@ -128,7 +128,7 @@ router.post(
     body('title').notEmpty().withMessage('Job title is required'),
     body('customerName').notEmpty().withMessage('Customer name is required'),
     body('customerEmail').optional().isEmail().withMessage('Invalid customer email'),
-    body('scheduledDate').optional().isISO8601().withMessage('Invalid date format')
+    body('scheduledDate').notEmpty().withMessage('Scheduled date is required').isISO8601().withMessage('Invalid date format')
       .custom((value) => {
         const today = new Date();
         today.setHours(0, 0, 0, 0);
@@ -144,6 +144,27 @@ router.post(
     }
 
     try {
+      // ── Save / update customer ──
+      const { customerName, customerPhone, customerEmail, address, customerId } = req.body;
+      let savedCustomer;
+      if (customerId) {
+        // Update existing customer with any changed details
+        savedCustomer = await Customer.findByIdAndUpdate(
+          customerId,
+          { name: customerName, phone: customerPhone || '', email: customerEmail || '', address: address || '' },
+          { new: true, runValidators: true }
+        );
+      }
+      if (!savedCustomer) {
+        // Create new customer
+        savedCustomer = await Customer.create({
+          name: customerName,
+          phone: customerPhone || '',
+          email: customerEmail || '',
+          address: address || '',
+        });
+      }
+
       const job = await JobService.createJob(req.body, req.user._id);
 
       // Notify admins and managers (managers can now see TENTATIVE jobs)
@@ -197,19 +218,12 @@ router.patch(
       const STATUS_MESSAGES = {
         CONFIRMED:   `Job "${job.title}" has been confirmed`,
         ASSIGNED:    `Job "${job.title}" has been assigned`,
-        DISPATCHED:  `Job "${job.title}" has been dispatched`,
         IN_PROGRESS: `Job "${job.title}" is now in progress`,
         COMPLETED:   `Job "${job.title}" has been completed`,
         BILLED:      `Job "${job.title}" has been billed`,
       };
 
       // Notify the relevant people
-      if (req.body.status === JOB_STATUS.DISPATCHED && job.assignedTechnician) {
-        // Notify the assigned technician
-        notifRecipientIds.push(job.assignedTechnician._id || job.assignedTechnician);
-        // Also notify admins and managers about the dispatch
-        notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
-      }
       if ([JOB_STATUS.IN_PROGRESS, JOB_STATUS.COMPLETED].includes(req.body.status)) {
         // Notify admins and managers
         notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
@@ -264,8 +278,16 @@ router.patch(
         return res.status(result.status).json({ success: false, error: result.error });
       }
 
-      // Notify admins and managers — technician will be notified when dispatched
+      // Notify the assigned technician immediately when assigned
       const assignedJob = result.data;
+      createNotification({
+        type: 'JOB_ASSIGNED',
+        message: `Job "${assignedJob.title}" has been assigned to you by ${req.user.name}. Instructions: ${req.body.notes}`,
+        jobId: assignedJob._id,
+        recipientIds: [req.body.technicianId],
+        excludeUserId: req.user._id,
+      });
+      // Also notify admins and managers
       createNotification({
         type: 'JOB_ASSIGNED',
         message: `Job "${assignedJob.title}" has been assigned to ${assignedJob.assignedTechnician?.name || 'a technician'} by ${req.user.name}`,
@@ -304,12 +326,12 @@ router.patch(
         return res.status(404).json({ success: false, error: 'Job not found' });
       }
 
-      // Must be in ASSIGNED, DISPATCHED, or IN_PROGRESS to reassign
-      const reassignableStatuses = [JOB_STATUS.ASSIGNED, JOB_STATUS.DISPATCHED, JOB_STATUS.IN_PROGRESS];
+      // Must be in ASSIGNED or IN_PROGRESS to reassign
+      const reassignableStatuses = [JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS];
       if (!reassignableStatuses.includes(job.status)) {
         return res.status(400).json({
           success: false,
-          error: `Cannot reassign a job in ${job.status} status. Job must be in ASSIGNED, DISPATCHED, or IN_PROGRESS.`,
+          error: `Cannot reassign a job in ${job.status} status. Job must be in ASSIGNED or IN_PROGRESS.`,
         });
       }
 
@@ -336,7 +358,15 @@ router.patch(
       await job.populate('assignedTechnician', 'name email');
       await job.populate('createdBy', 'name email');
 
-      // Notify admins and managers — technician will be notified when dispatched
+      // Notify the new technician immediately
+      createNotification({
+        type: 'JOB_REASSIGNED',
+        message: `Job "${job.title}" has been reassigned to you by ${req.user.name}`,
+        jobId: job._id,
+        recipientIds: [req.body.technicianId],
+        excludeUserId: req.user._id,
+      });
+      // Also notify admins and managers
       createNotification({
         type: 'JOB_REASSIGNED',
         message: `Job "${job.title}" reassigned from ${oldTechName} to ${newTechName} by ${req.user.name}`,
@@ -379,8 +409,8 @@ router.delete(
       const notifRecipientIds = [];
       const notifRoles = [];
 
-      // Only notify tech if the job was already dispatched to them
-      const techVisibleStatuses = [JOB_STATUS.DISPATCHED, JOB_STATUS.IN_PROGRESS, JOB_STATUS.COMPLETED];
+      // Notify tech if the job was already visible to them (ASSIGNED+)
+      const techVisibleStatuses = [JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS, JOB_STATUS.COMPLETED];
       if (techId && techVisibleStatuses.includes(job.status)) {
         notifRecipientIds.push(techId);
       }
@@ -447,8 +477,8 @@ router.put(
       const notifRecipientIds = [];
       const notifRoles = [ROLES.ADMIN, ROLES.OFFICE_MANAGER];
 
-      // Only notify tech if the job was already dispatched to them
-      const techVisible = [JOB_STATUS.DISPATCHED, JOB_STATUS.IN_PROGRESS, JOB_STATUS.COMPLETED];
+      // Notify tech if the job is already visible to them (ASSIGNED+)
+      const techVisible = [JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS, JOB_STATUS.COMPLETED];
       if (updatedJob.assignedTechnician && techVisible.includes(updatedJob.status)) {
         notifRecipientIds.push(updatedJob.assignedTechnician._id || updatedJob.assignedTechnician);
       }

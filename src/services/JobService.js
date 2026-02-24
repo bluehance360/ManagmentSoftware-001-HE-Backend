@@ -94,9 +94,9 @@ async function transitionStatus(jobId, newStatus, user, notes) {
   const err = validateTransition(currentStatus, newStatus, user.role);
   if (err) return { error: err, status: 400 };
 
-  // 2b) Manager must provide notes when dispatching
-  if (newStatus === JOB_STATUS.DISPATCHED && (!notes || !notes.trim())) {
-    return { error: 'Notes are required when dispatching a job to a technician', status: 400 };
+  // 2b) Notes are required when moving to IN_PROGRESS (tech starting work)
+  if (newStatus === JOB_STATUS.IN_PROGRESS && (!notes || !notes.trim())) {
+    return { error: 'Notes are required when starting a job', status: 400 };
   }
 
   // 3) Technician must be the one assigned
@@ -142,6 +142,7 @@ async function transitionStatus(jobId, newStatus, user, notes) {
 
 /**
  * Assign a technician (CONFIRMED → ASSIGNED) atomically.
+ * Notes are required so the manager provides assignment instructions.
  */
 async function assignTechnician(jobId, technicianId, user, notes) {
   // 1) Verify technician exists and has correct role
@@ -149,6 +150,11 @@ async function assignTechnician(jobId, technicianId, user, notes) {
   if (!technician) return { error: 'Technician not found', status: 404 };
   if (technician.role !== ROLES.TECHNICIAN) {
     return { error: 'User is not a technician', status: 400 };
+  }
+
+  // 2) Notes are required when assigning
+  if (!notes || !notes.trim()) {
+    return { error: 'Notes / instructions are required when assigning a technician', status: 400 };
   }
 
   // 2) Validate transition

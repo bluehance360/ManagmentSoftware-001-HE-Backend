@@ -15,7 +15,6 @@ const notificationSchema = new mongoose.Schema(
         'JOB_CONFIRMED',
         'JOB_ASSIGNED',
         'JOB_REASSIGNED',
-        'JOB_DISPATCHED',
         'JOB_STARTED',
         'JOB_COMPLETED',
         'JOB_BILLED',
