@@ -100,4 +100,118 @@ async function sendInvitationEmail({ to, role, token, invitedByName }) {
   });
 }
 
-module.exports = { sendInvitationEmail };
+/**
+ * Send an account deleted notification email.
+ * @param {Object} opts
+ * @param {string} opts.to   - Recipient email
+ * @param {string} opts.name - Recipient name
+ */
+async function sendAccountDeletedEmail({ to, name }) {
+  const html = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /></head>
+<body style="margin:0;padding:0;background-color:#f4f4f5;font-family:Arial,Helvetica,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f5;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+        <tr>
+          <td style="background-color:#C41E2A;padding:28px 32px;text-align:center;">
+            <h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:700;">Hosanna Electric</h1>
+            <p style="margin:6px 0 0;color:#fecaca;font-size:13px;">Field Service Management</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px;">
+            <h2 style="margin:0 0 8px;color:#1a1a1a;font-size:18px;">Account Removed</h2>
+            <p style="margin:0 0 20px;color:#6b7280;font-size:14px;line-height:1.6;">
+              Hi <strong>${name}</strong>,
+            </p>
+            <p style="margin:0 0 20px;color:#6b7280;font-size:14px;line-height:1.6;">
+              Your account on <strong>Hosanna Electric Field Service Management</strong> has been removed by an administrator.
+              You will no longer be able to access the platform.
+            </p>
+            <p style="margin:0;color:#6b7280;font-size:14px;line-height:1.6;">
+              If you believe this was a mistake, please contact your administrator.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="background-color:#f9fafb;padding:20px 32px;border-top:1px solid #e5e7eb;text-align:center;">
+            <p style="margin:0;color:#9ca3af;font-size:11px;">&copy; ${new Date().getFullYear()} Hosanna Electric. All rights reserved.</p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+  await transporter.sendMail({
+    from: `"${process.env.SMTP_FROM_NAME || 'Hosanna Electric'}" <${process.env.SMTP_FROM_EMAIL || 'noreply@example.com'}>`,
+    to,
+    subject: 'Your Hosanna Electric account has been removed',
+    html,
+  });
+}
+
+/**
+ * Send an invitation revoked notification email.
+ * @param {Object} opts
+ * @param {string} opts.to   - Recipient email
+ * @param {string} opts.role - The role they were invited for
+ */
+async function sendInviteRevokedEmail({ to, role }) {
+  const roleLabelMap = {
+    ADMIN: 'Administrator',
+    OFFICE_MANAGER: 'Office Manager',
+    TECHNICIAN: 'Technician',
+  };
+  const roleLabel = roleLabelMap[role] || role;
+
+  const html = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /></head>
+<body style="margin:0;padding:0;background-color:#f4f4f5;font-family:Arial,Helvetica,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f5;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+        <tr>
+          <td style="background-color:#C41E2A;padding:28px 32px;text-align:center;">
+            <h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:700;">Hosanna Electric</h1>
+            <p style="margin:6px 0 0;color:#fecaca;font-size:13px;">Field Service Management</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px;">
+            <h2 style="margin:0 0 8px;color:#1a1a1a;font-size:18px;">Invitation Revoked</h2>
+            <p style="margin:0 0 20px;color:#6b7280;font-size:14px;line-height:1.6;">
+              Your invitation to join <strong>Hosanna Electric</strong> as <strong style="color:#C41E2A;">${roleLabel}</strong> has been revoked by an administrator.
+            </p>
+            <p style="margin:0;color:#6b7280;font-size:14px;line-height:1.6;">
+              The account creation link in your previous email is no longer valid.
+              If you believe this was a mistake, please contact the administrator.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="background-color:#f9fafb;padding:20px 32px;border-top:1px solid #e5e7eb;text-align:center;">
+            <p style="margin:0;color:#9ca3af;font-size:11px;">&copy; ${new Date().getFullYear()} Hosanna Electric. All rights reserved.</p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+  await transporter.sendMail({
+    from: `"${process.env.SMTP_FROM_NAME || 'Hosanna Electric'}" <${process.env.SMTP_FROM_EMAIL || 'noreply@example.com'}>`,
+    to,
+    subject: 'Your Hosanna Electric invitation has been revoked',
+    html,
+  });
+}
+
+module.exports = { sendInvitationEmail, sendAccountDeletedEmail, sendInviteRevokedEmail };

@@ -4,9 +4,32 @@ const Invitation = require('../models/Invitation');
 const User = require('../models/User');
 const { authenticate, authorize } = require('../middleware/auth');
 const { ROLES } = require('../config/constants');
-const { sendInvitationEmail } = require('../services/EmailService');
+const { sendInvitationEmail, sendInviteRevokedEmail } = require('../services/EmailService');
+const { createNotification } = require('../services/NotificationService');
 
 const router = express.Router();
+
+// ── GET /api/invitations  (ADMIN only) ──────────────────────────────
+// List all pending (not yet accepted, not expired) invitations
+router.get(
+  '/',
+  authenticate,
+  authorize(ROLES.ADMIN),
+  async (req, res) => {
+    try {
+      const invitations = await Invitation.find({
+        accepted: false,
+        expiresAt: { $gt: new Date() },
+      })
+        .populate('invitedBy', 'name')
+        .sort({ createdAt: -1 });
+
+      res.json({ success: true, data: invitations });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
 
 // ── POST /api/invitations  (ADMIN only) ─────────────────────────────
 // Send an invitation email to a new team member
@@ -161,7 +184,7 @@ router.post(
       }
 
       // Create the user
-      await User.create({
+      const newUser = await User.create({
         email: invitation.email,
         password,
         name,
@@ -172,10 +195,54 @@ router.post(
       invitation.accepted = true;
       await invitation.save();
 
+      // Notify all admins that a new member joined
+      const roleLabel = {
+        [ROLES.ADMIN]: 'Administrator',
+        [ROLES.OFFICE_MANAGER]: 'Office Manager',
+        [ROLES.TECHNICIAN]: 'Technician',
+      }[newUser.role] || newUser.role;
+
+      createNotification({
+        type: 'TEAM_MEMBER_JOINED',
+        message: `New team member joined: ${newUser.name} has created their account as ${roleLabel}.`,
+        recipientRoles: [ROLES.ADMIN],
+      });
+
       res.json({
         success: true,
         message: 'Account created successfully. Please sign in.',
       });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── DELETE /api/invitations/:id  (ADMIN only) ───────────────────────
+// Revoke a pending invitation and notify the invitee
+router.delete(
+  '/:id',
+  authenticate,
+  authorize(ROLES.ADMIN),
+  async (req, res) => {
+    try {
+      const invitation = await Invitation.findById(req.params.id);
+      if (!invitation) {
+        return res.status(404).json({ success: false, error: 'Invitation not found' });
+      }
+      if (invitation.accepted) {
+        return res.status(400).json({ success: false, error: 'Invitation already accepted' });
+      }
+
+      const { email, role } = invitation;
+      await Invitation.findByIdAndDelete(req.params.id);
+
+      // Notify the invitee — non-blocking
+      sendInviteRevokedEmail({ to: email, role }).catch((err) =>
+        console.error('Failed to send revoke email:', err.message)
+      );
+
+      res.json({ success: true, message: 'Invitation revoked' });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
     }
