@@ -175,8 +175,7 @@ router.post(
       // Double-check no user was created in the meantime
       const existingUser = await User.findOne({ email: invitation.email });
       if (existingUser) {
-        invitation.accepted = true;
-        await invitation.save();
+        await Invitation.findByIdAndDelete(invitation._id);
         return res.status(400).json({
           success: false,
           error: 'An account with this email already exists. Please sign in.',
@@ -191,9 +190,8 @@ router.post(
         role: invitation.role,
       });
 
-      // Mark invitation as accepted
-      invitation.accepted = true;
-      await invitation.save();
+      // Remove invitation from DB (no longer needed)
+      await Invitation.findByIdAndDelete(invitation._id);
 
       // Notify all admins that a new member joined
       const roleLabel = {
