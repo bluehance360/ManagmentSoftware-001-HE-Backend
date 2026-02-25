@@ -19,7 +19,7 @@ const transporter = nodemailer.createTransport({
  * @param {string} opts.invitedByName - Name of the admin who invited
  */
 async function sendInvitationEmail({ to, role, token, invitedByName }) {
-  const frontendUrl = process.env.CORS_ORIGIN || 'http://localhost:5173';
+  const frontendUrl = process.env.CORS_ORIGIN.split(',')[0] || 'http://localhost:5173';
   const acceptUrl = `${frontendUrl}/accept-invite?token=${token}`;
 
   const roleLabelMap = {

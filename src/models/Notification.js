@@ -21,6 +21,7 @@ const notificationSchema = new mongoose.Schema(
         'JOB_UPDATED',
         'JOB_DELETED',
         'TEAM_MEMBER_JOINED',
+        'TECH_TIMEOUT',
       ],
       required: true,
     },

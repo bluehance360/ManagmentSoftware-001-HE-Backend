@@ -12,7 +12,44 @@
 const mongoose = require('mongoose');
 const Job = require('../models/Job');
 const User = require('../models/User');
+const TechTimeout = require('../models/TechTimeout');
 const { ROLES, JOB_STATUS, STATUS_TRANSITIONS } = require('../config/constants');
+
+/**
+ * Check if a technician is unavailable on a given date.
+ * Returns a reason string if unavailable, or null if available.
+ */
+async function checkTechAvailability(technicianId, date) {
+  if (!date) return null;
+  const day = new Date(date);
+  day.setHours(0, 0, 0, 0);
+  const dayEnd = new Date(day);
+  dayEnd.setHours(23, 59, 59, 999);
+
+  // 1) Check active job on that date
+  const activeJob = await Job.findOne({
+    assignedTechnician: technicianId,
+    status: { $in: [JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS] },
+    scheduledDate: { $gte: day, $lte: dayEnd },
+  }).select('title status').lean();
+
+  if (activeJob) {
+    return `Already assigned to "${activeJob.title}" (${activeJob.status}) on this date`;
+  }
+
+  // 2) Check timeout entry
+  const timeout = await TechTimeout.findOne({
+    technician: technicianId,
+    startDate: { $lte: dayEnd },
+    endDate: { $gte: day },
+  }).lean();
+
+  if (timeout) {
+    return timeout.reason || 'On timeout / leave';
+  }
+
+  return null;
+}
 
 // ── helpers ──────────────────────────────────────────────────────────
 
@@ -169,9 +206,21 @@ async function assignTechnician(jobId, technicianId, user, notes) {
     return { error: 'Notes / instructions are required when assigning a technician', status: 400 };
   }
 
-  // 2) Validate transition
+  // 2b) Validate transition
   const err = validateTransition(JOB_STATUS.CONFIRMED, JOB_STATUS.ASSIGNED, user.role);
   if (err) return { error: err, status: 400 };
+
+  // 2c) Check technician availability on the scheduled date
+  const job = await Job.findById(jobId).select('scheduledDate').lean();
+  if (job?.scheduledDate) {
+    const unavailReason = await checkTechAvailability(technicianId, job.scheduledDate);
+    if (unavailReason) {
+      return {
+        error: `Technician ${technician.name} is unavailable on this date: ${unavailReason}`,
+        status: 400,
+      };
+    }
+  }
 
   // 3) Atomic: only matches if status is still CONFIRMED
   const historyEntry = {
@@ -230,4 +279,5 @@ module.exports = {
   assignTechnician,
   updateJobDetails,
   validateTransition,
+  checkTechAvailability,
 };

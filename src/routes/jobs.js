@@ -6,6 +6,7 @@ const { authenticate, authorize } = require('../middleware/auth');
 const { ROLES, JOB_STATUS } = require('../config/constants');
 const JobService = require('../services/JobService');
 const Customer = require('../models/Customer');
+const TechTimeout = require('../models/TechTimeout');
 const { createNotification } = require('../services/NotificationService');
 const { getIO } = require('../socket');
 
@@ -325,6 +326,18 @@ router.patch(
       const oldTechId = job.assignedTechnician?._id?.toString();
       const oldTechName = job.assignedTechnician?.name || 'previous technician';
       const previousStatus = job.status;
+
+      // Check new tech availability on scheduled date
+      if (job.scheduledDate) {
+        const unavailReason = await JobService.checkTechAvailability(req.body.technicianId, job.scheduledDate);
+        if (unavailReason) {
+          const newTech = await User.findById(req.body.technicianId).select('name');
+          return res.status(400).json({
+            success: false,
+            error: `Technician ${newTech?.name || ''} is unavailable on this date: ${unavailReason}`,
+          });
+        }
+      }
 
       // Fetch new technician's name
       const newTech = await User.findById(req.body.technicianId).select('name');
