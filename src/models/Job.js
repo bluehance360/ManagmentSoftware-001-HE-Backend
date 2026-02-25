@@ -41,9 +41,16 @@ const jobSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
+    customer: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Customer',
+    },
+    companyName: {
+      type: String,
+      trim: true,
+    },
     customerName: {
       type: String,
-      required: [true, 'Customer name is required'],
       trim: true,
     },
     customerPhone: {

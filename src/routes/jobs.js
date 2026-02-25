@@ -62,6 +62,7 @@ router.get('/', async (req, res) => {
       Job.find(filter)
         .populate('assignedTechnician', 'name email')
         .populate('createdBy', 'name email')
+        .populate('customer', 'name phone email address')
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parseInt(limit)),
@@ -89,6 +90,7 @@ router.get('/:id', async (req, res) => {
     const job = await Job.findById(req.params.id)
       .populate('assignedTechnician', 'name email')
       .populate('createdBy', 'name email')
+      .populate('customer', 'name phone email address')
       .populate('statusHistory.changedBy', 'name email role');
 
     if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
@@ -126,8 +128,7 @@ router.post(
   authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   [
     body('title').notEmpty().withMessage('Job title is required'),
-    body('customerName').notEmpty().withMessage('Customer name is required'),
-    body('customerEmail').optional().isEmail().withMessage('Invalid customer email'),
+    body('customerId').notEmpty().withMessage('Customer is required').isMongoId().withMessage('Invalid customer ID'),
     body('scheduledDate').notEmpty().withMessage('Scheduled date is required').isISO8601().withMessage('Invalid date format')
       .custom((value) => {
         const today = new Date();
@@ -136,6 +137,7 @@ router.post(
         return true;
       }),
     body('estimatedCost').optional().isFloat({ min: 0 }).withMessage('Must be a positive number'),
+    body('companyName').optional().trim(),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -144,33 +146,18 @@ router.post(
     }
 
     try {
-      // ── Save / update customer ──
-      const { customerName, customerPhone, customerEmail, address, customerId } = req.body;
-      let savedCustomer;
-      if (customerId) {
-        // Update existing customer with any changed details
-        savedCustomer = await Customer.findByIdAndUpdate(
-          customerId,
-          { name: customerName, phone: customerPhone || '', email: customerEmail || '', address: address || '' },
-          { new: true, runValidators: true }
-        );
-      }
-      if (!savedCustomer) {
-        // Create new customer
-        savedCustomer = await Customer.create({
-          name: customerName,
-          phone: customerPhone || '',
-          email: customerEmail || '',
-          address: address || '',
-        });
+      // Verify customer exists
+      const customer = await Customer.findById(req.body.customerId);
+      if (!customer) {
+        return res.status(404).json({ success: false, error: 'Customer not found' });
       }
 
       const job = await JobService.createJob(req.body, req.user._id);
 
-      // Notify admins and managers (managers can now see TENTATIVE jobs)
+      // Notify admins and managers
       createNotification({
         type: 'JOB_CREATED',
-        message: `New job created by ${req.user.name}: "${job.title}" for ${job.customerName}`,
+        message: `New job created by ${req.user.name}: "${job.title}" for ${customer.name}`,
         jobId: job._id,
         recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,

@@ -20,6 +20,7 @@ const POPULATE_FIELDS = [
   { path: 'assignedTechnician', select: 'name email' },
   { path: 'createdBy', select: 'name email' },
   { path: 'statusHistory.changedBy', select: 'name email role' },
+  { path: 'customer', select: 'name phone email address' },
 ];
 
 /**
@@ -50,13 +51,9 @@ function validateTransition(currentStatus, newStatus, role) {
  * Create a new job. Only ADMIN.
  */
 async function createJob(data, userId) {
-  const job = await Job.create({
+  const jobData = {
     title: data.title,
     description: data.description,
-    customerName: data.customerName,
-    customerPhone: data.customerPhone,
-    customerEmail: data.customerEmail,
-    address: data.address,
     scheduledDate: data.scheduledDate,
     estimatedCost: data.estimatedCost,
     notes: data.notes,
@@ -70,7 +67,22 @@ async function createJob(data, userId) {
         notes: 'Job created',
       },
     ],
-  });
+  };
+
+  // New flow: customer reference + optional companyName
+  if (data.customerId) {
+    jobData.customer = data.customerId;
+  }
+  if (data.companyName) {
+    jobData.companyName = data.companyName;
+  }
+  // Legacy fields (backward compat for old jobs)
+  if (data.customerName) jobData.customerName = data.customerName;
+  if (data.customerPhone) jobData.customerPhone = data.customerPhone;
+  if (data.customerEmail) jobData.customerEmail = data.customerEmail;
+  if (data.address) jobData.address = data.address;
+
+  const job = await Job.create(jobData);
 
   return Job.populate(job, POPULATE_FIELDS);
 }
