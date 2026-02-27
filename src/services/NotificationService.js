@@ -2,6 +2,7 @@ const Notification = require('../models/Notification');
 const User = require('../models/User');
 const { ROLES } = require('../config/constants');
 const { emitToUsers } = require('../socket');
+const { sendPushToUsers } = require('./PushService');
 
 /**
  * Create notification(s) for relevant users.
@@ -55,6 +56,19 @@ async function createNotification({ type, message, jobId, recipientIds, recipien
       recipientIds: recipients,
       excludeUserId,
     });
+
+    // Send Web Push to offline users (fire-and-forget)
+    sendPushToUsers(recipients, {
+      title: 'Hosanna Electric',
+      body: message,
+      icon: '/Hosanna-logo.webp',
+      badge: '/Hosanna-logo.webp',
+      data: {
+        url: jobId ? '/jobs' : type === 'TEAM_MEMBER_JOINED' ? '/team' : type === 'TECH_TIMEOUT' ? '/timeout' : '/dashboard',
+        jobId,
+        type,
+      },
+    }).catch(() => {}); // non-blocking
   } catch (error) {
     console.error('Failed to create notifications:', error.message);
     // Non-blocking — don't throw

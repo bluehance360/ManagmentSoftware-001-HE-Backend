@@ -1,9 +1,72 @@
 const express = require('express');
 const Notification = require('../models/Notification');
+const PushSubscription = require('../models/PushSubscription');
 const { authenticate } = require('../middleware/auth');
 
 const router = express.Router();
 router.use(authenticate);
+
+// ══════════════════════════════════════════════════════════════════════
+// Push subscription endpoints (must come before /:id param routes)
+// ══════════════════════════════════════════════════════════════════════
+
+// ── GET /api/notifications/push/vapid-key ───────────────────────────
+router.get('/push/vapid-key', (req, res) => {
+  const vapidPublicKey = process.env.VAPID_PUBLIC_KEY;
+  if (!vapidPublicKey) {
+    return res.status(500).json({ success: false, error: 'VAPID public key not configured' });
+  }
+  res.json({ success: true, data: { vapidPublicKey } });
+});
+
+router.post('/push/subscribe', async (req, res) => {
+  try {
+    const { endpoint, keys } = req.body;
+
+    if (!endpoint || !keys?.p256dh || !keys?.auth) {
+      return res.status(400).json({ success: false, error: 'Invalid subscription data' });
+    }
+
+    // Upsert: update if same user+endpoint exists, insert otherwise
+    await PushSubscription.findOneAndUpdate(
+      { user: req.user._id, endpoint },
+      {
+        user: req.user._id,
+        endpoint,
+        keys: { p256dh: keys.p256dh, auth: keys.auth },
+        userAgent: req.headers['user-agent'] || '',
+      },
+      { upsert: true, new: true }
+    );
+
+    res.json({ success: true, message: 'Push subscription registered' });
+  } catch (error) {
+    // Handle duplicate key errors gracefully
+    if (error.code === 11000) {
+      return res.json({ success: true, message: 'Push subscription already registered' });
+    }
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+router.delete('/push/unsubscribe', async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+    if (!endpoint) {
+      return res.status(400).json({ success: false, error: 'Endpoint is required' });
+    }
+
+    await PushSubscription.deleteOne({ user: req.user._id, endpoint });
+    res.json({ success: true, message: 'Push subscription removed' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// In-app notification endpoints
+// ══════════════════════════════════════════════════════════════════════
 
 // ── GET /api/notifications ──────────────────────────────────────────
 // Get user's notifications (most recent first, limit 50)
