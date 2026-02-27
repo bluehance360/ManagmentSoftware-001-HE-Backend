@@ -46,14 +46,33 @@ router.get(
   authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   async (req, res) => {
     try {
+      const Job = require('../models/Job');
+      const { JOB_STATUS } = require('../config/constants');
+
       const technicians = await User.find({
         role: ROLES.TECHNICIAN,
         isActive: true,
-      }).select('name email');
+      }).select('name email').lean();
+
+      // Attach active job info so the frontend can show a "Busy" indicator
+      const activeJobs = await Job.find({
+        assignedTechnician: { $in: technicians.map((t) => t._id) },
+        status: { $in: [JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS] },
+      }).select('assignedTechnician title status').lean();
+
+      const activeJobMap = {};
+      for (const j of activeJobs) {
+        activeJobMap[j.assignedTechnician.toString()] = { title: j.title, status: j.status };
+      }
+
+      const enriched = technicians.map((t) => ({
+        ...t,
+        activeJob: activeJobMap[t._id.toString()] || null,
+      }));
 
       res.json({
         success: true,
-        data: technicians,
+        data: enriched,
       });
     } catch (error) {
       res.status(500).json({

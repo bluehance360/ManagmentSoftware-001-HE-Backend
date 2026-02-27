@@ -33,6 +33,8 @@ router.get('/', async (req, res) => {
         JOB_STATUS.IN_PROGRESS,
         JOB_STATUS.COMPLETED,
         JOB_STATUS.BILLED,
+        JOB_STATUS.PAID,
+        JOB_STATUS.CLOSED,
       ];
       filter.status = status
         ? (techVisibleStatuses.includes(status) ? status : '__none__')
@@ -46,6 +48,8 @@ router.get('/', async (req, res) => {
         JOB_STATUS.IN_PROGRESS,
         JOB_STATUS.COMPLETED,
         JOB_STATUS.BILLED,
+        JOB_STATUS.PAID,
+        JOB_STATUS.CLOSED,
       ];
       filter.status = status
         ? (managerVisibleStatuses.includes(status) ? status : '__none__')
@@ -108,6 +112,8 @@ router.get('/:id', async (req, res) => {
         JOB_STATUS.IN_PROGRESS,
         JOB_STATUS.COMPLETED,
         JOB_STATUS.BILLED,
+        JOB_STATUS.PAID,
+        JOB_STATUS.CLOSED,
       ];
       if (!techVisibleStatuses.includes(job.status)) {
         return res.status(403).json({ success: false, error: 'Not authorized to view this job' });
@@ -209,6 +215,8 @@ router.patch(
         IN_PROGRESS: `Job "${job.title}" is now in progress`,
         COMPLETED:   `Job "${job.title}" has been completed`,
         BILLED:      `Job "${job.title}" has been billed`,
+        PAID:        `Job "${job.title}" has been marked as paid`,
+        CLOSED:      `Job "${job.title}" has been closed`,
       };
 
       // Notify the relevant people
@@ -216,8 +224,9 @@ router.patch(
         // Notify admins and managers
         notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
       }
-      if (req.body.status === JOB_STATUS.BILLED) {
+      if ([JOB_STATUS.BILLED, JOB_STATUS.PAID, JOB_STATUS.CLOSED].includes(req.body.status)) {
         notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
+        // Technicians are NOT notified for PAID / CLOSED — those statuses are hidden from them
       }
       if (req.body.status === JOB_STATUS.CONFIRMED) {
         notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
@@ -377,6 +386,53 @@ router.patch(
 
       broadcastJobUpdate();
       res.json({ success: true, data: job, message: `Reassigned to ${newTechName}` });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── PATCH /api/jobs/:id/revert (ADMIN, OFFICE_MANAGER) ─────────────
+router.patch(
+  '/:id/revert',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  async (req, res) => {
+    try {
+      const result = await JobService.revertStatus(req.params.id, req.user);
+      if (result.error) {
+        return res.status(result.status).json({ success: false, error: result.error });
+      }
+
+      const job = result.data;
+      const message = `Job "${job.title}" status reverted from ${result.revertedFrom} to ${result.revertedTo} by ${req.user.name}`;
+
+      // Notify the assigned technician only if the revert involves statuses visible to them
+      // (PAID/CLOSED are hidden from techs, so don't notify them when reverting those)
+      const techHiddenStatuses = [JOB_STATUS.PAID, JOB_STATUS.CLOSED];
+      if (job.assignedTechnician && !techHiddenStatuses.includes(result.revertedFrom)) {
+        createNotification({
+          type: 'JOB_UPDATED',
+          message,
+          jobId: job._id,
+          recipientIds: [job.assignedTechnician._id],
+          excludeUserId: req.user._id,
+        });
+      }
+      // Notify all admins and managers
+      createNotification({
+        type: 'JOB_UPDATED',
+        message,
+        jobId: job._id,
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        excludeUserId: req.user._id,
+      });
+
+      broadcastJobUpdate();
+      res.json({
+        success: true,
+        data: job,
+        message: `Status reverted to ${result.revertedTo}`,
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
     }

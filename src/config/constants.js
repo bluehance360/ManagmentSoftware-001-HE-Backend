@@ -11,12 +11,14 @@ const ROLES = {
 
 // Job statuses
 const JOB_STATUS = {
-  TENTATIVE: 'TENTATIVE',
-  CONFIRMED: 'CONFIRMED',
-  ASSIGNED: 'ASSIGNED',
+  TENTATIVE:   'TENTATIVE',
+  CONFIRMED:   'CONFIRMED',
+  ASSIGNED:    'ASSIGNED',
   IN_PROGRESS: 'IN_PROGRESS',
-  COMPLETED: 'COMPLETED',
-  BILLED: 'BILLED',
+  COMPLETED:   'COMPLETED',
+  BILLED:      'BILLED',
+  PAID:        'PAID',
+  CLOSED:      'CLOSED',
 };
 
 // Valid status transitions with required roles
@@ -41,7 +43,13 @@ const STATUS_TRANSITIONS = {
     [JOB_STATUS.BILLED]: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
   },
   [JOB_STATUS.BILLED]: {
-    // Terminal state - no transitions allowed
+    [JOB_STATUS.PAID]: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+  },
+  [JOB_STATUS.PAID]: {
+    [JOB_STATUS.CLOSED]: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+  },
+  [JOB_STATUS.CLOSED]: {
+    // Terminal state - no further transitions
   },
 };
 

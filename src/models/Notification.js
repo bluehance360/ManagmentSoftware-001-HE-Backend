@@ -18,6 +18,8 @@ const notificationSchema = new mongoose.Schema(
         'JOB_STARTED',
         'JOB_COMPLETED',
         'JOB_BILLED',
+        'JOB_PAID',
+        'JOB_CLOSED',
         'JOB_UPDATED',
         'JOB_DELETED',
         'TEAM_MEMBER_JOINED',
