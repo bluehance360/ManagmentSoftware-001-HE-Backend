@@ -9,12 +9,41 @@ const Customer = require('../models/Customer');
 const TechTimeout = require('../models/TechTimeout');
 const { createNotification } = require('../services/NotificationService');
 const { getIO } = require('../socket');
+const {
+  buildDocumentKey,
+  getUploadUrl,
+  getDownloadUrl,
+  headObject,
+  deleteObject,
+} = require('../services/S3Service');
 
 const router = express.Router();
 
 function broadcastJobUpdate() {
   const io = getIO();
   if (io) io.emit('jobs:updated');
+}
+
+const TECH_VISIBLE_STATUSES = [
+  JOB_STATUS.ASSIGNED,
+  JOB_STATUS.IN_PROGRESS,
+  JOB_STATUS.COMPLETED,
+  JOB_STATUS.BILLED,
+  JOB_STATUS.PAID,
+  JOB_STATUS.CLOSED,
+];
+
+function canAccessJob(user, job) {
+  if (!job) return false;
+  if ([ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(user.role)) return true;
+  if (user.role !== ROLES.TECHNICIAN) return false;
+  if (!TECH_VISIBLE_STATUSES.includes(job.status)) return false;
+  const techId = job.assignedTechnician?._id || job.assignedTechnician;
+  return techId?.toString() === user._id.toString();
+}
+
+function normalizeDocNote(note) {
+  return typeof note === 'string' ? note.trim() : '';
 }
 
 router.use(authenticate);
@@ -96,7 +125,9 @@ router.get('/:id', async (req, res) => {
       .populate('assignedTechnician', 'name email')
       .populate('createdBy', 'name email')
       .populate('customer', 'name phone email address')
-      .populate('statusHistory.changedBy', 'name email role');
+      .populate('statusHistory.changedBy', 'name email role')
+      .populate('statusHistory.technician', 'name email')
+      .populate('documents.uploadedBy', 'name email role');
 
     if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
 
@@ -178,6 +209,232 @@ router.post(
   }
 );
 
+// ── POST /api/jobs/:id/documents/presign ───────────────────────────
+router.post(
+  '/:id/documents/presign',
+  [
+    body('files').isArray({ min: 1 }).withMessage('files must be a non-empty array'),
+    body('files.*.name').notEmpty().withMessage('file name is required'),
+    body('files.*.contentType').optional().isString(),
+    body('files.*.size').optional().isInt({ min: 0 }).withMessage('file size must be >= 0'),
+    body('files.*.note').optional().isString().withMessage('file note must be a string'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const job = await Job.findById(req.params.id).select('_id title status assignedTechnician');
+      if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (!canAccessJob(req.user, job)) {
+        return res.status(403).json({ success: false, error: 'Not authorized to upload documents for this job' });
+      }
+
+      const files = req.body.files.slice(0, 10);
+
+      const ALLOWED_EXT = new Set(['pdf', 'doc', 'docx', 'txt', 'xml']);
+      const invalid = files.find((f) => {
+        const ext = (f.name || '').split('.').pop().toLowerCase();
+        return !ALLOWED_EXT.has(ext);
+      });
+      if (invalid) {
+        return res.status(400).json({
+          success: false,
+          error: `File type not allowed: "${invalid.name}". Accepted: PDF, DOC, DOCX, TXT, XML`,
+        });
+      }
+
+      const uploads = await Promise.all(
+        files.map(async (file) => {
+          const key = buildDocumentKey(job._id.toString(), file.name);
+          const contentType = file.contentType || 'application/octet-stream';
+          const presignedUrl = await getUploadUrl({ key, contentType, expiresIn: 300 });
+          return {
+            key,
+            fileName: file.name,
+            contentType,
+            size: Number(file.size) || 0,
+            note: normalizeDocNote(file.note),
+            presignedUrl,
+            expiresIn: 300,
+          };
+        })
+      );
+
+      res.json({ success: true, data: { uploads } });
+    } catch (error) {
+      const status = error.status || 500;
+      res.status(status).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── POST /api/jobs/:id/documents/complete ──────────────────────────
+router.post(
+  '/:id/documents/complete',
+  [
+    body('documents').isArray({ min: 1 }).withMessage('documents must be a non-empty array'),
+    body('documents.*.key').notEmpty().withMessage('document key is required'),
+    body('documents.*.fileName').notEmpty().withMessage('document fileName is required'),
+    body('documents.*.note').optional().isString().withMessage('document note must be a string'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const job = await Job.findById(req.params.id)
+        .select('_id title status assignedTechnician documents')
+        .populate('assignedTechnician', 'name email');
+
+      if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (!canAccessJob(req.user, job)) {
+        return res.status(403).json({ success: false, error: 'Not authorized to add documents for this job' });
+      }
+
+      const incoming = req.body.documents.slice(0, 10);
+      const createdDocs = [];
+
+      for (const item of incoming) {
+        if (!item.key.startsWith(`jobs/${job._id}/documents/`)) {
+          return res.status(400).json({ success: false, error: 'Invalid document key for this job' });
+        }
+
+        const meta = await headObject(item.key);
+        createdDocs.push({
+          key: item.key,
+          fileName: item.fileName,
+          contentType: meta.ContentType || 'application/octet-stream',
+          size: Number(meta.ContentLength) || 0,
+          note: normalizeDocNote(item.note),
+          uploadedBy: req.user._id,
+          uploadedAt: new Date(),
+        });
+      }
+
+      job.documents.push(...createdDocs);
+      await job.save();
+      await job.populate('documents.uploadedBy', 'name email role');
+
+      const latest = job.documents.slice(-createdDocs.length);
+      const firstFile = latest[0]?.fileName || 'document';
+      const message = latest.length === 1
+        ? `${req.user.name} uploaded "${firstFile}" to job "${job.title}"`
+        : `${req.user.name} uploaded ${latest.length} documents to job "${job.title}"`;
+
+      const recipientIds = [];
+      if (job.assignedTechnician?._id) recipientIds.push(job.assignedTechnician._id);
+
+      createNotification({
+        type: 'JOB_DOCUMENT_UPLOADED',
+        message,
+        jobId: job._id,
+        recipientIds,
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        excludeUserId: req.user._id,
+      });
+
+      broadcastJobUpdate();
+      res.json({ success: true, data: { documents: latest } });
+    } catch (error) {
+      const status = error.status || 500;
+      res.status(status).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── GET /api/jobs/:id/documents/:docId/url ─────────────────────────
+router.get('/:id/documents/:docId/url', async (req, res) => {
+  try {
+    const job = await Job.findById(req.params.id)
+      .select('_id status assignedTechnician documents');
+
+    if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+    if (!canAccessJob(req.user, job)) {
+      return res.status(403).json({ success: false, error: 'Not authorized to view documents for this job' });
+    }
+
+    const doc = job.documents.id(req.params.docId);
+    if (!doc) return res.status(404).json({ success: false, error: 'Document not found' });
+
+    const url = await getDownloadUrl({
+      key: doc.key,
+      fileName: doc.fileName,
+      expiresIn: 900,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        url,
+        fileName: doc.fileName,
+        contentType: doc.contentType,
+      },
+    });
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ success: false, error: error.message });
+  }
+});
+
+// ── DELETE /api/jobs/:id/documents/:docId ───────────────────────────
+router.delete('/:id/documents/:docId', async (req, res) => {
+  try {
+    const job = await Job.findById(req.params.id)
+      .select('_id title status assignedTechnician documents')
+      .populate('assignedTechnician', 'name email');
+
+    if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+    if (!canAccessJob(req.user, job)) {
+      return res.status(403).json({ success: false, error: 'Not authorized' });
+    }
+
+    const doc = job.documents.id(req.params.docId);
+    if (!doc) return res.status(404).json({ success: false, error: 'Document not found' });
+
+    // Only the uploader can delete their own documents
+    if (doc.uploadedBy.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ success: false, error: 'You can only delete documents you uploaded' });
+    }
+
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+    const fileName = doc.fileName;
+
+    // Delete from S3 (fire-and-forget, doc is removed from DB regardless)
+    try { await deleteObject(doc.key); } catch { /* ignore S3 errors */ }
+
+    // Remove from DB
+    job.documents.pull(req.params.docId);
+    await job.save();
+
+    // Notify admins/managers + assigned tech
+    const recipientIds = [];
+    if (job.assignedTechnician?._id) recipientIds.push(job.assignedTechnician._id);
+
+    let message = `${req.user.name} deleted "${fileName}" from job "${job.title}"`;
+    if (reason) message += ` — Reason: ${reason}`;
+
+    createNotification({
+      type: 'JOB_DOCUMENT_DELETED',
+      message,
+      jobId: job._id,
+      recipientIds,
+      recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+      excludeUserId: req.user._id,
+    });
+
+    broadcastJobUpdate();
+    res.json({ success: true });
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ success: false, error: error.message });
+  }
+});
+
 // ── PATCH /api/jobs/:id/status ──────────────────────────────────────
 router.patch(
   '/:id/status',
@@ -221,6 +478,17 @@ router.patch(
 
       // Notify the relevant people
       if ([JOB_STATUS.IN_PROGRESS, JOB_STATUS.COMPLETED].includes(req.body.status)) {
+        const actorIsAdmin = [ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(req.user.role);
+        const statusLabel  = req.body.status === JOB_STATUS.IN_PROGRESS ? 'In Progress' : 'Completed';
+        const techName     = job.assignedTechnician?.name;
+
+        if (actorIsAdmin && techName) {
+     
+          STATUS_MESSAGES[req.body.status] =
+            `"${job.title}" marked as ${statusLabel} by ${req.user.name} on behalf of ${techName}`;
+          // Notify the assigned tech
+          notifRecipientIds.push(job.assignedTechnician._id);
+        }
         // Notify admins and managers
         notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
       }
@@ -561,7 +829,8 @@ router.get('/:id/history', async (req, res) => {
   try {
     const job = await Job.findById(req.params.id)
       .select('statusHistory status title')
-      .populate('statusHistory.changedBy', 'name email role');
+      .populate('statusHistory.changedBy', 'name email role')
+      .populate('statusHistory.technician', 'name email');
 
     if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
 

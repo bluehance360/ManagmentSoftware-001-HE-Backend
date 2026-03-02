@@ -56,6 +56,8 @@ const POPULATE_FIELDS = [
   { path: 'assignedTechnician', select: 'name email' },
   { path: 'createdBy', select: 'name email' },
   { path: 'statusHistory.changedBy', select: 'name email role' },
+  { path: 'statusHistory.technician', select: 'name email' },
+  { path: 'documents.uploadedBy', select: 'name email role' },
   { path: 'customer', select: 'name phone email address' },
 ];
 
@@ -226,6 +228,7 @@ async function assignTechnician(jobId, technicianId, user, notes) {
     fromStatus: JOB_STATUS.CONFIRMED,
     toStatus: JOB_STATUS.ASSIGNED,
     changedBy: user._id,
+    technician: technicianId,
     changedAt: new Date(),
     notes: notes || `Assigned to ${technician.name}`,
   };

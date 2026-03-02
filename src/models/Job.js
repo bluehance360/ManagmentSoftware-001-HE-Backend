@@ -26,6 +26,51 @@ const statusHistorySchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
+    technician: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+  },
+  { _id: true }
+);
+
+const documentSchema = new mongoose.Schema(
+  {
+    key: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    fileName: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    contentType: {
+      type: String,
+      trim: true,
+      default: 'application/octet-stream',
+    },
+    size: {
+      type: Number,
+      min: 0,
+      default: 0,
+    },
+    note: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    uploadedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+    },
+    uploadedAt: {
+      type: Date,
+      default: Date.now,
+    },
   },
   { _id: true }
 );
@@ -84,6 +129,7 @@ const jobSchema = new mongoose.Schema(
       required: true,
     },
     statusHistory: [statusHistorySchema],
+    documents: [documentSchema],
     estimatedCost: {
       type: Number,
       min: 0,
