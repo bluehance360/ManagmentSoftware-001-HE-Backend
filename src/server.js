@@ -8,6 +8,9 @@ const authRoutes = require('./routes/auth');
 const jobRoutes = require('./routes/jobs');
 const userRoutes = require('./routes/users');
 const notificationRoutes = require('./routes/notifications');
+const invitationRoutes = require('./routes/invitations');
+const customerRoutes = require('./routes/customers');
+const techTimeoutRoutes = require('./routes/techTimeouts');
 const { errorHandler, notFound } = require('./middleware/errorHandler');
 
 const app = express();
@@ -20,7 +23,7 @@ initSocket(server);
 
 // CORS Configuration
 const corsOptions = {
-  origin: process.env.CORS_ORIGIN || 'http://localhost:5173',
+  origin: process.env.CORS_ORIGIN.split(',') || 'http://localhost:5173',
   credentials: true,
   optionsSuccessStatus: 200,
 };
@@ -35,6 +38,9 @@ app.use('/api/auth', authRoutes);
 app.use('/api/jobs', jobRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/invitations', invitationRoutes);
+app.use('/api/customers', customerRoutes);
+app.use('/api/tech-timeouts', techTimeoutRoutes);
 
 // Error handling
 app.use(notFound);

@@ -2,6 +2,7 @@ const express = require('express');
 const User = require('../models/User');
 const { authenticate, authorize } = require('../middleware/auth');
 const { ROLES } = require('../config/constants');
+const { sendAccountDeletedEmail } = require('../services/EmailService');
 
 const router = express.Router();
 
@@ -45,14 +46,33 @@ router.get(
   authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   async (req, res) => {
     try {
+      const Job = require('../models/Job');
+      const { JOB_STATUS } = require('../config/constants');
+
       const technicians = await User.find({
         role: ROLES.TECHNICIAN,
         isActive: true,
-      }).select('name email');
+      }).select('name email').lean();
+
+      // Attach active job info so the frontend can show a "Busy" indicator
+      const activeJobs = await Job.find({
+        assignedTechnician: { $in: technicians.map((t) => t._id) },
+        status: { $in: [JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS] },
+      }).select('assignedTechnician title status').lean();
+
+      const activeJobMap = {};
+      for (const j of activeJobs) {
+        activeJobMap[j.assignedTechnician.toString()] = { title: j.title, status: j.status };
+      }
+
+      const enriched = technicians.map((t) => ({
+        ...t,
+        activeJob: activeJobMap[t._id.toString()] || null,
+      }));
 
       res.json({
         success: true,
-        data: technicians,
+        data: enriched,
       });
     } catch (error) {
       res.status(500).json({
@@ -88,6 +108,35 @@ router.get('/:id', authorize(ROLES.ADMIN), async (req, res) => {
       success: false,
       error: error.message,
     });
+  }
+});
+
+/**
+ * @route   DELETE /api/users/:id
+ * @desc    Delete a user account (Admin only)
+ * @access  Private (ADMIN)
+ */
+router.delete('/:id', authorize(ROLES.ADMIN), async (req, res) => {
+  try {
+    if (req.params.id === req.user._id.toString()) {
+      return res.status(400).json({ success: false, error: 'You cannot delete your own account' });
+    }
+
+    const user = await User.findById(req.params.id);
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    await User.findByIdAndDelete(req.params.id);
+
+    // Notify the deleted user — non-blocking
+    sendAccountDeletedEmail({ to: user.email, name: user.name }).catch((err) =>
+      console.error('Failed to send account deleted email:', err.message)
+    );
+
+    res.json({ success: true, message: `Account for ${user.name} has been deleted` });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 

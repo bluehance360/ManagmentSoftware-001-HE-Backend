@@ -5,14 +5,45 @@ const User = require('../models/User');
 const { authenticate, authorize } = require('../middleware/auth');
 const { ROLES, JOB_STATUS } = require('../config/constants');
 const JobService = require('../services/JobService');
+const Customer = require('../models/Customer');
+const TechTimeout = require('../models/TechTimeout');
 const { createNotification } = require('../services/NotificationService');
 const { getIO } = require('../socket');
+const {
+  buildDocumentKey,
+  getUploadUrl,
+  getDownloadUrl,
+  headObject,
+  deleteObject,
+} = require('../services/S3Service');
 
 const router = express.Router();
 
 function broadcastJobUpdate() {
   const io = getIO();
   if (io) io.emit('jobs:updated');
+}
+
+const TECH_VISIBLE_STATUSES = [
+  JOB_STATUS.ASSIGNED,
+  JOB_STATUS.IN_PROGRESS,
+  JOB_STATUS.COMPLETED,
+  JOB_STATUS.BILLED,
+  JOB_STATUS.PAID,
+  JOB_STATUS.CLOSED,
+];
+
+function canAccessJob(user, job) {
+  if (!job) return false;
+  if ([ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(user.role)) return true;
+  if (user.role !== ROLES.TECHNICIAN) return false;
+  if (!TECH_VISIBLE_STATUSES.includes(job.status)) return false;
+  const techId = job.assignedTechnician?._id || job.assignedTechnician;
+  return techId?.toString() === user._id.toString();
+}
+
+function normalizeDocNote(note) {
+  return typeof note === 'string' ? note.trim() : '';
 }
 
 router.use(authenticate);
@@ -25,25 +56,29 @@ router.get('/', async (req, res) => {
 
     if (req.user.role === ROLES.TECHNICIAN) {
       filter.assignedTechnician = req.user._id;
-      // Technicians only see jobs that have been dispatched to them by the manager
+      // Technicians see all assigned jobs immediately
       const techVisibleStatuses = [
-        JOB_STATUS.DISPATCHED,
+        JOB_STATUS.ASSIGNED,
         JOB_STATUS.IN_PROGRESS,
         JOB_STATUS.COMPLETED,
         JOB_STATUS.BILLED,
+        JOB_STATUS.PAID,
+        JOB_STATUS.CLOSED,
       ];
       filter.status = status
         ? (techVisibleStatuses.includes(status) ? status : '__none__')
         : { $in: techVisibleStatuses };
     } else if (req.user.role === ROLES.OFFICE_MANAGER) {
-      // Managers see everything except TENTATIVE
+      // Managers see everything including TENTATIVE
       const managerVisibleStatuses = [
+        JOB_STATUS.TENTATIVE,
         JOB_STATUS.CONFIRMED,
         JOB_STATUS.ASSIGNED,
-        JOB_STATUS.DISPATCHED,
         JOB_STATUS.IN_PROGRESS,
         JOB_STATUS.COMPLETED,
         JOB_STATUS.BILLED,
+        JOB_STATUS.PAID,
+        JOB_STATUS.CLOSED,
       ];
       filter.status = status
         ? (managerVisibleStatuses.includes(status) ? status : '__none__')
@@ -61,6 +96,7 @@ router.get('/', async (req, res) => {
       Job.find(filter)
         .populate('assignedTechnician', 'name email')
         .populate('createdBy', 'name email')
+        .populate('customer', 'name phone email address')
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parseInt(limit)),
@@ -88,22 +124,27 @@ router.get('/:id', async (req, res) => {
     const job = await Job.findById(req.params.id)
       .populate('assignedTechnician', 'name email')
       .populate('createdBy', 'name email')
-      .populate('statusHistory.changedBy', 'name email role');
+      .populate('customer', 'name phone email address')
+      .populate('statusHistory.changedBy', 'name email role')
+      .populate('statusHistory.technician', 'name email')
+      .populate('documents.uploadedBy', 'name email role');
 
     if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
 
-    // TENTATIVE jobs are only visible to ADMIN
-    if (job.status === JOB_STATUS.TENTATIVE && req.user.role !== ROLES.ADMIN) {
+    // TENTATIVE jobs are visible to ADMIN and OFFICE_MANAGER
+    if (job.status === JOB_STATUS.TENTATIVE && ![ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(req.user.role)) {
       return res.status(403).json({ success: false, error: 'Not authorized to view this job' });
     }
 
-    // Technicians can only see DISPATCHED+ jobs (not ASSIGNED/CONFIRMED)
+    // Technicians can only see ASSIGNED+ jobs
     if (req.user.role === ROLES.TECHNICIAN) {
       const techVisibleStatuses = [
-        JOB_STATUS.DISPATCHED,
+        JOB_STATUS.ASSIGNED,
         JOB_STATUS.IN_PROGRESS,
         JOB_STATUS.COMPLETED,
         JOB_STATUS.BILLED,
+        JOB_STATUS.PAID,
+        JOB_STATUS.CLOSED,
       ];
       if (!techVisibleStatuses.includes(job.status)) {
         return res.status(403).json({ success: false, error: 'Not authorized to view this job' });
@@ -119,15 +160,14 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// ── POST /api/jobs (ADMIN) ──────────────────────────────────────────
+// ── POST /api/jobs (ADMIN, OFFICE_MANAGER) ──────────────────────────
 router.post(
   '/',
-  authorize(ROLES.ADMIN),
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   [
     body('title').notEmpty().withMessage('Job title is required'),
-    body('customerName').notEmpty().withMessage('Customer name is required'),
-    body('customerEmail').optional().isEmail().withMessage('Invalid customer email'),
-    body('scheduledDate').optional().isISO8601().withMessage('Invalid date format')
+    body('customerId').notEmpty().withMessage('Customer is required').isMongoId().withMessage('Invalid customer ID'),
+    body('scheduledDate').notEmpty().withMessage('Scheduled date is required').isISO8601().withMessage('Invalid date format')
       .custom((value) => {
         const today = new Date();
         today.setHours(0, 0, 0, 0);
@@ -135,6 +175,7 @@ router.post(
         return true;
       }),
     body('estimatedCost').optional().isFloat({ min: 0 }).withMessage('Must be a positive number'),
+    body('companyName').optional().trim(),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -143,14 +184,20 @@ router.post(
     }
 
     try {
+      // Verify customer exists
+      const customer = await Customer.findById(req.body.customerId);
+      if (!customer) {
+        return res.status(404).json({ success: false, error: 'Customer not found' });
+      }
+
       const job = await JobService.createJob(req.body, req.user._id);
 
-      // Notify other admins only (new jobs are TENTATIVE, managers can't see them)
+      // Notify admins and managers
       createNotification({
         type: 'JOB_CREATED',
-        message: `New job created by ${req.user.name}: "${job.title}" for ${job.customerName}`,
+        message: `New job created by ${req.user.name}: "${job.title}" for ${customer.name}`,
         jobId: job._id,
-        recipientRoles: [ROLES.ADMIN],
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,
       });
 
@@ -161,6 +208,232 @@ router.post(
     }
   }
 );
+
+// ── POST /api/jobs/:id/documents/presign ───────────────────────────
+router.post(
+  '/:id/documents/presign',
+  [
+    body('files').isArray({ min: 1 }).withMessage('files must be a non-empty array'),
+    body('files.*.name').notEmpty().withMessage('file name is required'),
+    body('files.*.contentType').optional().isString(),
+    body('files.*.size').optional().isInt({ min: 0 }).withMessage('file size must be >= 0'),
+    body('files.*.note').optional().isString().withMessage('file note must be a string'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const job = await Job.findById(req.params.id).select('_id title status assignedTechnician');
+      if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (!canAccessJob(req.user, job)) {
+        return res.status(403).json({ success: false, error: 'Not authorized to upload documents for this job' });
+      }
+
+      const files = req.body.files.slice(0, 10);
+
+      const ALLOWED_EXT = new Set(['pdf', 'doc', 'docx', 'txt', 'xml']);
+      const invalid = files.find((f) => {
+        const ext = (f.name || '').split('.').pop().toLowerCase();
+        return !ALLOWED_EXT.has(ext);
+      });
+      if (invalid) {
+        return res.status(400).json({
+          success: false,
+          error: `File type not allowed: "${invalid.name}". Accepted: PDF, DOC, DOCX, TXT, XML`,
+        });
+      }
+
+      const uploads = await Promise.all(
+        files.map(async (file) => {
+          const key = buildDocumentKey(job._id.toString(), file.name);
+          const contentType = file.contentType || 'application/octet-stream';
+          const presignedUrl = await getUploadUrl({ key, contentType, expiresIn: 300 });
+          return {
+            key,
+            fileName: file.name,
+            contentType,
+            size: Number(file.size) || 0,
+            note: normalizeDocNote(file.note),
+            presignedUrl,
+            expiresIn: 300,
+          };
+        })
+      );
+
+      res.json({ success: true, data: { uploads } });
+    } catch (error) {
+      const status = error.status || 500;
+      res.status(status).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── POST /api/jobs/:id/documents/complete ──────────────────────────
+router.post(
+  '/:id/documents/complete',
+  [
+    body('documents').isArray({ min: 1 }).withMessage('documents must be a non-empty array'),
+    body('documents.*.key').notEmpty().withMessage('document key is required'),
+    body('documents.*.fileName').notEmpty().withMessage('document fileName is required'),
+    body('documents.*.note').optional().isString().withMessage('document note must be a string'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const job = await Job.findById(req.params.id)
+        .select('_id title status assignedTechnician documents')
+        .populate('assignedTechnician', 'name email');
+
+      if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (!canAccessJob(req.user, job)) {
+        return res.status(403).json({ success: false, error: 'Not authorized to add documents for this job' });
+      }
+
+      const incoming = req.body.documents.slice(0, 10);
+      const createdDocs = [];
+
+      for (const item of incoming) {
+        if (!item.key.startsWith(`jobs/${job._id}/documents/`)) {
+          return res.status(400).json({ success: false, error: 'Invalid document key for this job' });
+        }
+
+        const meta = await headObject(item.key);
+        createdDocs.push({
+          key: item.key,
+          fileName: item.fileName,
+          contentType: meta.ContentType || 'application/octet-stream',
+          size: Number(meta.ContentLength) || 0,
+          note: normalizeDocNote(item.note),
+          uploadedBy: req.user._id,
+          uploadedAt: new Date(),
+        });
+      }
+
+      job.documents.push(...createdDocs);
+      await job.save();
+      await job.populate('documents.uploadedBy', 'name email role');
+
+      const latest = job.documents.slice(-createdDocs.length);
+      const firstFile = latest[0]?.fileName || 'document';
+      const message = latest.length === 1
+        ? `${req.user.name} uploaded "${firstFile}" to job "${job.title}"`
+        : `${req.user.name} uploaded ${latest.length} documents to job "${job.title}"`;
+
+      const recipientIds = [];
+      if (job.assignedTechnician?._id) recipientIds.push(job.assignedTechnician._id);
+
+      createNotification({
+        type: 'JOB_DOCUMENT_UPLOADED',
+        message,
+        jobId: job._id,
+        recipientIds,
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        excludeUserId: req.user._id,
+      });
+
+      broadcastJobUpdate();
+      res.json({ success: true, data: { documents: latest } });
+    } catch (error) {
+      const status = error.status || 500;
+      res.status(status).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── GET /api/jobs/:id/documents/:docId/url ─────────────────────────
+router.get('/:id/documents/:docId/url', async (req, res) => {
+  try {
+    const job = await Job.findById(req.params.id)
+      .select('_id status assignedTechnician documents');
+
+    if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+    if (!canAccessJob(req.user, job)) {
+      return res.status(403).json({ success: false, error: 'Not authorized to view documents for this job' });
+    }
+
+    const doc = job.documents.id(req.params.docId);
+    if (!doc) return res.status(404).json({ success: false, error: 'Document not found' });
+
+    const url = await getDownloadUrl({
+      key: doc.key,
+      fileName: doc.fileName,
+      expiresIn: 900,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        url,
+        fileName: doc.fileName,
+        contentType: doc.contentType,
+      },
+    });
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ success: false, error: error.message });
+  }
+});
+
+// ── DELETE /api/jobs/:id/documents/:docId ───────────────────────────
+router.delete('/:id/documents/:docId', async (req, res) => {
+  try {
+    const job = await Job.findById(req.params.id)
+      .select('_id title status assignedTechnician documents')
+      .populate('assignedTechnician', 'name email');
+
+    if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+    if (!canAccessJob(req.user, job)) {
+      return res.status(403).json({ success: false, error: 'Not authorized' });
+    }
+
+    const doc = job.documents.id(req.params.docId);
+    if (!doc) return res.status(404).json({ success: false, error: 'Document not found' });
+
+    // Only the uploader can delete their own documents
+    if (doc.uploadedBy.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ success: false, error: 'You can only delete documents you uploaded' });
+    }
+
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+    const fileName = doc.fileName;
+
+    // Delete from S3 (fire-and-forget, doc is removed from DB regardless)
+    try { await deleteObject(doc.key); } catch { /* ignore S3 errors */ }
+
+    // Remove from DB
+    job.documents.pull(req.params.docId);
+    await job.save();
+
+    // Notify admins/managers + assigned tech
+    const recipientIds = [];
+    if (job.assignedTechnician?._id) recipientIds.push(job.assignedTechnician._id);
+
+    let message = `${req.user.name} deleted "${fileName}" from job "${job.title}"`;
+    if (reason) message += ` — Reason: ${reason}`;
+
+    createNotification({
+      type: 'JOB_DOCUMENT_DELETED',
+      message,
+      jobId: job._id,
+      recipientIds,
+      recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+      excludeUserId: req.user._id,
+    });
+
+    broadcastJobUpdate();
+    res.json({ success: true });
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ success: false, error: error.message });
+  }
+});
 
 // ── PATCH /api/jobs/:id/status ──────────────────────────────────────
 router.patch(
@@ -196,25 +469,32 @@ router.patch(
       const STATUS_MESSAGES = {
         CONFIRMED:   `Job "${job.title}" has been confirmed`,
         ASSIGNED:    `Job "${job.title}" has been assigned`,
-        DISPATCHED:  `Job "${job.title}" has been dispatched`,
         IN_PROGRESS: `Job "${job.title}" is now in progress`,
         COMPLETED:   `Job "${job.title}" has been completed`,
         BILLED:      `Job "${job.title}" has been billed`,
+        PAID:        `Job "${job.title}" has been marked as paid`,
+        CLOSED:      `Job "${job.title}" has been closed`,
       };
 
       // Notify the relevant people
-      if (req.body.status === JOB_STATUS.DISPATCHED && job.assignedTechnician) {
-        // Notify the assigned technician
-        notifRecipientIds.push(job.assignedTechnician._id || job.assignedTechnician);
-        // Also notify admins about the dispatch
-        notifRoles.push(ROLES.ADMIN);
-      }
       if ([JOB_STATUS.IN_PROGRESS, JOB_STATUS.COMPLETED].includes(req.body.status)) {
+        const actorIsAdmin = [ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(req.user.role);
+        const statusLabel  = req.body.status === JOB_STATUS.IN_PROGRESS ? 'In Progress' : 'Completed';
+        const techName     = job.assignedTechnician?.name;
+
+        if (actorIsAdmin && techName) {
+     
+          STATUS_MESSAGES[req.body.status] =
+            `"${job.title}" marked as ${statusLabel} by ${req.user.name} on behalf of ${techName}`;
+          // Notify the assigned tech
+          notifRecipientIds.push(job.assignedTechnician._id);
+        }
         // Notify admins and managers
         notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
       }
-      if (req.body.status === JOB_STATUS.BILLED) {
-        notifRoles.push(ROLES.ADMIN);
+      if ([JOB_STATUS.BILLED, JOB_STATUS.PAID, JOB_STATUS.CLOSED].includes(req.body.status)) {
+        notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
+        // Technicians are NOT notified for PAID / CLOSED — those statuses are hidden from them
       }
       if (req.body.status === JOB_STATUS.CONFIRMED) {
         notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
@@ -237,10 +517,10 @@ router.patch(
   }
 );
 
-// ── PATCH /api/jobs/:id/assign (ADMIN) ──────────────────────────────
+// ── PATCH /api/jobs/:id/assign (ADMIN, OFFICE_MANAGER) ──────────────
 router.patch(
   '/:id/assign',
-  authorize(ROLES.ADMIN),
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   [
     body('technicianId').isMongoId().withMessage('Valid technician ID required'),
     body('notes').optional().isString(),
@@ -263,13 +543,21 @@ router.patch(
         return res.status(result.status).json({ success: false, error: result.error });
       }
 
-      // Notify managers only — technician will be notified when manager dispatches
+      // Notify the assigned technician immediately when assigned
       const assignedJob = result.data;
+      createNotification({
+        type: 'JOB_ASSIGNED',
+        message: `Job "${assignedJob.title}" has been assigned to you by ${req.user.name}. Instructions: ${req.body.notes}`,
+        jobId: assignedJob._id,
+        recipientIds: [req.body.technicianId],
+        excludeUserId: req.user._id,
+      });
+      // Also notify admins and managers
       createNotification({
         type: 'JOB_ASSIGNED',
         message: `Job "${assignedJob.title}" has been assigned to ${assignedJob.assignedTechnician?.name || 'a technician'} by ${req.user.name}`,
         jobId: assignedJob._id,
-        recipientRoles: [ROLES.OFFICE_MANAGER],
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,
       });
 
@@ -281,10 +569,10 @@ router.patch(
   }
 );
 
-// ── PATCH /api/jobs/:id/reassign (ADMIN) ────────────────────────────
+// ── PATCH /api/jobs/:id/reassign (ADMIN, OFFICE_MANAGER) ────────────
 router.patch(
   '/:id/reassign',
-  authorize(ROLES.ADMIN),
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   [
     body('technicianId').isMongoId().withMessage('Valid technician ID required'),
     body('notes').optional().isString(),
@@ -303,18 +591,30 @@ router.patch(
         return res.status(404).json({ success: false, error: 'Job not found' });
       }
 
-      // Must be in ASSIGNED, DISPATCHED, or IN_PROGRESS to reassign
-      const reassignableStatuses = [JOB_STATUS.ASSIGNED, JOB_STATUS.DISPATCHED, JOB_STATUS.IN_PROGRESS];
+      // Must be in ASSIGNED or IN_PROGRESS to reassign
+      const reassignableStatuses = [JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS];
       if (!reassignableStatuses.includes(job.status)) {
         return res.status(400).json({
           success: false,
-          error: `Cannot reassign a job in ${job.status} status. Job must be in ASSIGNED, DISPATCHED, or IN_PROGRESS.`,
+          error: `Cannot reassign a job in ${job.status} status. Job must be in ASSIGNED or IN_PROGRESS.`,
         });
       }
 
       const oldTechId = job.assignedTechnician?._id?.toString();
       const oldTechName = job.assignedTechnician?.name || 'previous technician';
       const previousStatus = job.status;
+
+      // Check new tech availability on scheduled date
+      if (job.scheduledDate) {
+        const unavailReason = await JobService.checkTechAvailability(req.body.technicianId, job.scheduledDate);
+        if (unavailReason) {
+          const newTech = await User.findById(req.body.technicianId).select('name');
+          return res.status(400).json({
+            success: false,
+            error: `Technician ${newTech?.name || ''} is unavailable on this date: ${unavailReason}`,
+          });
+        }
+      }
 
       // Fetch new technician's name
       const newTech = await User.findById(req.body.technicianId).select('name');
@@ -335,12 +635,20 @@ router.patch(
       await job.populate('assignedTechnician', 'name email');
       await job.populate('createdBy', 'name email');
 
-      // Notify managers only — technician will be notified when dispatched
+      // Notify the new technician immediately
+      createNotification({
+        type: 'JOB_REASSIGNED',
+        message: `Job "${job.title}" has been reassigned to you by ${req.user.name}`,
+        jobId: job._id,
+        recipientIds: [req.body.technicianId],
+        excludeUserId: req.user._id,
+      });
+      // Also notify admins and managers
       createNotification({
         type: 'JOB_REASSIGNED',
         message: `Job "${job.title}" reassigned from ${oldTechName} to ${newTechName} by ${req.user.name}`,
         jobId: job._id,
-        recipientRoles: [ROLES.OFFICE_MANAGER],
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,
       });
 
@@ -352,10 +660,57 @@ router.patch(
   }
 );
 
-// ── DELETE /api/jobs/:id (ADMIN) ────────────────────────────────────
+// ── PATCH /api/jobs/:id/revert (ADMIN, OFFICE_MANAGER) ─────────────
+router.patch(
+  '/:id/revert',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  async (req, res) => {
+    try {
+      const result = await JobService.revertStatus(req.params.id, req.user);
+      if (result.error) {
+        return res.status(result.status).json({ success: false, error: result.error });
+      }
+
+      const job = result.data;
+      const message = `Job "${job.title}" status reverted from ${result.revertedFrom} to ${result.revertedTo} by ${req.user.name}`;
+
+      // Notify the assigned technician only if the revert involves statuses visible to them
+      // (PAID/CLOSED are hidden from techs, so don't notify them when reverting those)
+      const techHiddenStatuses = [JOB_STATUS.PAID, JOB_STATUS.CLOSED];
+      if (job.assignedTechnician && !techHiddenStatuses.includes(result.revertedFrom)) {
+        createNotification({
+          type: 'JOB_UPDATED',
+          message,
+          jobId: job._id,
+          recipientIds: [job.assignedTechnician._id],
+          excludeUserId: req.user._id,
+        });
+      }
+      // Notify all admins and managers
+      createNotification({
+        type: 'JOB_UPDATED',
+        message,
+        jobId: job._id,
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        excludeUserId: req.user._id,
+      });
+
+      broadcastJobUpdate();
+      res.json({
+        success: true,
+        data: job,
+        message: `Status reverted to ${result.revertedTo}`,
+      });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── DELETE /api/jobs/:id (ADMIN, OFFICE_MANAGER) ────────────────────
 router.delete(
   '/:id',
-  authorize(ROLES.ADMIN),
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   async (req, res) => {
     try {
       const job = await Job.findById(req.params.id)
@@ -378,16 +733,14 @@ router.delete(
       const notifRecipientIds = [];
       const notifRoles = [];
 
-      // Only notify tech if the job was already dispatched to them
-      const techVisibleStatuses = [JOB_STATUS.DISPATCHED, JOB_STATUS.IN_PROGRESS, JOB_STATUS.COMPLETED];
+      // Notify tech if the job was already visible to them (ASSIGNED+)
+      const techVisibleStatuses = [JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS, JOB_STATUS.COMPLETED];
       if (techId && techVisibleStatuses.includes(job.status)) {
         notifRecipientIds.push(techId);
       }
 
-      // Only notify managers if the job was visible to them (not TENTATIVE)
-      if (job.status !== JOB_STATUS.TENTATIVE) {
-        notifRoles.push(ROLES.OFFICE_MANAGER);
-      }
+      // Notify admins and managers (both can see all jobs including TENTATIVE)
+      notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
 
       if (notifRecipientIds.length > 0 || notifRoles.length > 0) {
         createNotification({
@@ -446,15 +799,10 @@ router.put(
       // Notify relevant people based on job visibility
       const updatedJob = result.data;
       const notifRecipientIds = [];
-      const notifRoles = [ROLES.ADMIN];
+      const notifRoles = [ROLES.ADMIN, ROLES.OFFICE_MANAGER];
 
-      // Only notify managers if the job is visible to them (not TENTATIVE)
-      if (updatedJob.status !== JOB_STATUS.TENTATIVE) {
-        notifRoles.push(ROLES.OFFICE_MANAGER);
-      }
-
-      // Only notify tech if the job was already dispatched to them
-      const techVisible = [JOB_STATUS.DISPATCHED, JOB_STATUS.IN_PROGRESS, JOB_STATUS.COMPLETED];
+      // Notify tech if the job is already visible to them (ASSIGNED+)
+      const techVisible = [JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS, JOB_STATUS.COMPLETED];
       if (updatedJob.assignedTechnician && techVisible.includes(updatedJob.status)) {
         notifRecipientIds.push(updatedJob.assignedTechnician._id || updatedJob.assignedTechnician);
       }
@@ -481,7 +829,8 @@ router.get('/:id/history', async (req, res) => {
   try {
     const job = await Job.findById(req.params.id)
       .select('statusHistory status title')
-      .populate('statusHistory.changedBy', 'name email role');
+      .populate('statusHistory.changedBy', 'name email role')
+      .populate('statusHistory.technician', 'name email');
 
     if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
 

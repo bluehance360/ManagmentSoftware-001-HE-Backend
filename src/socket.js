@@ -7,7 +7,7 @@ let io = null;
 function initSocket(httpServer) {
   io = new Server(httpServer, {
     cors: {
-      origin: process.env.CORS_ORIGIN || 'http://localhost:5173',
+      origin: process.env.CORS_ORIGIN.split(',') || 'http://localhost:5173',
       credentials: true,
     },
   });
