@@ -1,6 +1,7 @@
 const express = require('express');
-const { body, validationResult } = require('express-validator');
+const { body, param, validationResult } = require('express-validator');
 const Job = require('../models/Job');
+const JobType = require('../models/JobType');
 const User = require('../models/User');
 const { authenticate, authorize } = require('../middleware/auth');
 const { ROLES, JOB_STATUS } = require('../config/constants');
@@ -34,6 +35,59 @@ const TECH_VISIBLE_STATUSES = [
   JOB_STATUS.CLOSED,
 ];
 
+function normalizeJobType(value) {
+  return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
+}
+
+async function ensureJobTypeSaved(name) {
+  const normalizedName = normalizeJobType(name);
+  if (!normalizedName) return;
+
+  await JobType.findOneAndUpdate(
+    { normalizedName: normalizedName.toLowerCase() },
+    {
+      $setOnInsert: {
+        name: normalizedName,
+        normalizedName: normalizedName.toLowerCase(),
+      },
+    },
+    { upsert: true, new: true }
+  );
+}
+
+async function getJobTypeUsageMap() {
+  const usage = await Job.aggregate([
+    { $match: { jobType: { $exists: true, $ne: '' } } },
+    {
+      $group: {
+        _id: { $toLower: '$jobType' },
+        usageCount: { $sum: 1 },
+        jobTitles: { $addToSet: '$title' },
+      },
+    },
+  ]);
+
+  const map = new Map();
+  usage.forEach((item) => {
+    map.set(item._id, {
+      usageCount: item.usageCount,
+      jobTitles: item.jobTitles || [],
+    });
+  });
+  return map;
+}
+
+async function listJobTypesWithUsage() {
+  const usageMap = await getJobTypeUsageMap();
+  const types = await JobType.find({}).sort({ name: 1 }).lean();
+  return types.map((type) => ({
+    _id: type._id,
+    name: type.name,
+    usageCount: usageMap.get(type.normalizedName)?.usageCount || 0,
+    jobTitles: usageMap.get(type.normalizedName)?.jobTitles || [],
+  }));
+}
+
 function canAccessJob(user, job) {
   if (!job) return false;
   if ([ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(user.role)) return true;
@@ -63,7 +117,7 @@ router.use(authenticate);
 // ── GET /api/jobs ────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
-    const { status, assignedTechnician, page = 1, limit = 20 } = req.query;
+    const { status, assignedTechnician, jobType, page = 1, limit = 20 } = req.query;
     const filter = {};
 
     if (req.user.role === ROLES.TECHNICIAN) {
@@ -102,6 +156,9 @@ router.get('/', async (req, res) => {
     if (assignedTechnician && req.user.role !== ROLES.TECHNICIAN) {
       filter.assignedTechnician = assignedTechnician;
     }
+    if (jobType) {
+      filter.jobType = normalizeJobType(jobType);
+    }
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
     const [jobs, total] = await Promise.all([
@@ -129,6 +186,84 @@ router.get('/', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+// ── GET /api/jobs/job-types ─────────────────────────────────────────
+router.get('/job-types', async (req, res) => {
+  try {
+    const jobTypes = await listJobTypesWithUsage();
+    res.json({ success: true, data: jobTypes });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ── POST /api/jobs/job-types (ADMIN, OFFICE_MANAGER) ───────────────
+router.post(
+  '/job-types',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  [
+    body('name').notEmpty().withMessage('Job type name is required').isString().withMessage('Job type name must be a string'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const normalizedName = normalizeJobType(req.body.name);
+      if (!normalizedName) {
+        return res.status(400).json({ success: false, error: 'Job type name is required' });
+      }
+
+      await ensureJobTypeSaved(normalizedName);
+      const jobTypes = await listJobTypesWithUsage();
+      const created = jobTypes.find((item) => item.name.toLowerCase() === normalizedName.toLowerCase());
+
+      res.status(201).json({ success: true, data: { jobType: created, jobTypes } });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── DELETE /api/jobs/job-types/:id (ADMIN, OFFICE_MANAGER) ─────────
+router.delete(
+  '/job-types/:id',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  [param('id').isMongoId().withMessage('Invalid job type ID')],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const type = await JobType.findById(req.params.id).lean();
+      if (!type) {
+        return res.status(404).json({ success: false, error: 'Job type not found' });
+      }
+
+      const usageCount = await Job.countDocuments({
+        $expr: {
+          $eq: [{ $toLower: '$jobType' }, type.normalizedName],
+        },
+      });
+      await JobType.findByIdAndDelete(req.params.id);
+
+      const jobTypes = await listJobTypesWithUsage();
+      res.json({
+        success: true,
+        data: {
+          deleted: { _id: type._id, name: type.name, usageCount },
+          jobTypes,
+        },
+      });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
 
 // ── GET /api/jobs/:id ────────────────────────────────────────────────
 router.get('/:id', async (req, res) => {
@@ -179,6 +314,7 @@ router.post(
   [
     body('title').notEmpty().withMessage('Job title is required'),
     body('customerId').notEmpty().withMessage('Customer is required').isMongoId().withMessage('Invalid customer ID'),
+    body('jobType').notEmpty().withMessage('Job type is required').isString().withMessage('Job type must be a string'),
     body('scheduledDate').notEmpty().withMessage('Scheduled date is required').custom(validateScheduledDate),
     body('estimatedCost').optional().isFloat({ min: 0 }).withMessage('Must be a positive number'),
     body('companyName').optional().trim(),
@@ -195,6 +331,12 @@ router.post(
       if (!customer) {
         return res.status(404).json({ success: false, error: 'Customer not found' });
       }
+
+      req.body.jobType = normalizeJobType(req.body.jobType);
+      if (!req.body.jobType) {
+        return res.status(400).json({ success: false, error: 'Job type is required' });
+      }
+      await ensureJobTypeSaved(req.body.jobType);
 
       const job = await JobService.createJob(req.body, req.user._id);
 
@@ -773,6 +915,7 @@ router.put(
   authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   [
     body('title').optional().notEmpty().withMessage('Title cannot be empty'),
+    body('jobType').optional().isString().withMessage('Job type must be a string'),
     body('customerEmail').optional().isEmail().withMessage('Invalid customer email'),
     body('scheduledDate').optional().custom(validateScheduledDate),
     body('estimatedCost').optional().isFloat({ min: 0 }).withMessage('Must be positive'),
@@ -789,6 +932,14 @@ router.put(
       const existingJob = await Job.findById(req.params.id);
       if (existingJob && existingJob.status === JOB_STATUS.BILLED) {
         return res.status(400).json({ success: false, error: 'Billed jobs cannot be edited' });
+      }
+
+      if (req.body.jobType !== undefined) {
+        req.body.jobType = normalizeJobType(req.body.jobType);
+        if (!req.body.jobType) {
+          return res.status(400).json({ success: false, error: 'Job type cannot be empty' });
+        }
+        await ensureJobTypeSaved(req.body.jobType);
       }
 
       const result = await JobService.updateJobDetails(req.params.id, req.body);

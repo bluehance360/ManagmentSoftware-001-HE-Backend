@@ -136,6 +136,10 @@ const jobSchema = new mongoose.Schema(
       type: Number,
       min: 0,
     },
+    jobType: {
+      type: String,
+      trim: true,
+    },
     actualCost: {
       type: Number,
       min: 0,
@@ -160,5 +164,6 @@ const jobSchema = new mongoose.Schema(
 jobSchema.index({ status: 1, assignedTechnician: 1 });
 jobSchema.index({ createdAt: -1 });
 jobSchema.index({ scheduledDate: 1 });
+jobSchema.index({ jobType: 1 });
 
 module.exports = mongoose.model('Job', jobSchema);

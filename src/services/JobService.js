@@ -92,6 +92,7 @@ async function createJob(data, userId) {
     title: data.title,
     description: data.description,
     scheduledDate: normalizedScheduledDate,
+    jobType: typeof data.jobType === 'string' ? data.jobType.trim() : undefined,
     estimatedCost: data.estimatedCost,
     notes: data.notes,
     createdBy: userId,
@@ -268,6 +269,9 @@ async function updateJobDetails(jobId, data) {
   const { status, statusHistory, assignedTechnician, createdBy, ...safeData } = data;
   if (safeData.scheduledDate !== undefined) {
     safeData.scheduledDate = normalizeDateOnly(safeData.scheduledDate);
+  }
+  if (safeData.jobType !== undefined) {
+    safeData.jobType = typeof safeData.jobType === 'string' ? safeData.jobType.trim() : safeData.jobType;
   }
 
   const job = await Job.findByIdAndUpdate(jobId, safeData, {
