@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { DATE_ONLY_RE } = require('../utils/dateOnly');
 
 const techTimeoutSchema = new mongoose.Schema(
   {
@@ -9,12 +10,14 @@ const techTimeoutSchema = new mongoose.Schema(
       index: true,
     },
     startDate: {
-      type: Date,
+      type: String,
       required: [true, 'Start date is required'],
+      match: [DATE_ONLY_RE, 'startDate must be in YYYY-MM-DD format'],
     },
     endDate: {
-      type: Date,
+      type: String,
       required: [true, 'End date is required'],
+      match: [DATE_ONLY_RE, 'endDate must be in YYYY-MM-DD format'],
     },
     reason: {
       type: String,

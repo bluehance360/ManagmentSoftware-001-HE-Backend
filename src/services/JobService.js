@@ -14,12 +14,13 @@ const Job = require('../models/Job');
 const User = require('../models/User');
 const TechTimeout = require('../models/TechTimeout');
 const { ROLES, JOB_STATUS, STATUS_TRANSITIONS } = require('../config/constants');
+const { normalizeDateOnly, toLocalDateOnly } = require('../utils/dateOnly');
 
 /**
  * Check if a technician is unavailable on a given date.
  * Returns a reason string if unavailable, or null if available.
  */
-async function checkTechAvailability(technicianId) {
+async function checkTechAvailability(technicianId, scheduledDate) {
   // 1) Block if the tech already has any active job (ASSIGNED or IN_PROGRESS).
   // A technician must finish their current job before being assigned a new one.
   const activeJob = await Job.findOne({
@@ -31,16 +32,13 @@ async function checkTechAvailability(technicianId) {
     return `Already has an active job: "${activeJob.title}" (${activeJob.status})`;
   }
 
-  // 2) Check if the tech is on time-off TODAY (the day the assignment is being made).
-  const now = new Date();
-  now.setHours(0, 0, 0, 0);
-  const nowEnd = new Date(now);
-  nowEnd.setHours(23, 59, 59, 999);
+  // 2) Check if the tech is on time-off on the target schedule day.
+  const targetDay = normalizeDateOnly(scheduledDate) || toLocalDateOnly();
 
   const timeout = await TechTimeout.findOne({
     technician: technicianId,
-    startDate: { $lte: nowEnd },
-    endDate:   { $gte: now },
+    startDate: { $lte: targetDay },
+    endDate: { $gte: targetDay },
   }).lean();
 
   if (timeout) {
@@ -89,10 +87,12 @@ function validateTransition(currentStatus, newStatus, role) {
  * Create a new job. Only ADMIN.
  */
 async function createJob(data, userId) {
+  const normalizedScheduledDate = normalizeDateOnly(data.scheduledDate);
   const jobData = {
     title: data.title,
     description: data.description,
-    scheduledDate: data.scheduledDate,
+    scheduledDate: normalizedScheduledDate,
+    jobType: typeof data.jobType === 'string' ? data.jobType.trim() : undefined,
     estimatedCost: data.estimatedCost,
     notes: data.notes,
     createdBy: userId,
@@ -195,6 +195,9 @@ async function transitionStatus(jobId, newStatus, user, notes) {
  * Notes are required so the manager provides assignment instructions.
  */
 async function assignTechnician(jobId, technicianId, user, notes) {
+  const jobForSchedule = await Job.findById(jobId).select('scheduledDate').lean();
+  if (!jobForSchedule) return { error: 'Job not found', status: 404 };
+
   // 1) Verify technician exists and has correct role
   const technician = await User.findById(technicianId);
   if (!technician) return { error: 'Technician not found', status: 404 };
@@ -214,7 +217,7 @@ async function assignTechnician(jobId, technicianId, user, notes) {
   // 2c) Check technician availability:
   //  - blocks if tech has any active (ASSIGNED/IN_PROGRESS) job
   //  - blocks if tech is on time-off today
-  const unavailReason = await checkTechAvailability(technicianId);
+  const unavailReason = await checkTechAvailability(technicianId, jobForSchedule.scheduledDate);
   if (unavailReason) {
     return {
       error: `Technician ${technician.name} is unavailable: ${unavailReason}`,
@@ -264,6 +267,12 @@ async function assignTechnician(jobId, technicianId, user, notes) {
 async function updateJobDetails(jobId, data) {
   // Strip status-related fields — never allow status changes through this path
   const { status, statusHistory, assignedTechnician, createdBy, ...safeData } = data;
+  if (safeData.scheduledDate !== undefined) {
+    safeData.scheduledDate = normalizeDateOnly(safeData.scheduledDate);
+  }
+  if (safeData.jobType !== undefined) {
+    safeData.jobType = typeof safeData.jobType === 'string' ? safeData.jobType.trim() : safeData.jobType;
+  }
 
   const job = await Job.findByIdAndUpdate(jobId, safeData, {
     new: true,

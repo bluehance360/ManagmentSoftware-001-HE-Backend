@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const { JOB_STATUS } = require('../config/constants');
+const { DATE_ONLY_RE } = require('../utils/dateOnly');
 
 // Sub-schema for status history
 const statusHistorySchema = new mongoose.Schema(
@@ -112,7 +113,8 @@ const jobSchema = new mongoose.Schema(
       trim: true,
     },
     scheduledDate: {
-      type: Date,
+      type: String,
+      match: [DATE_ONLY_RE, 'scheduledDate must be in YYYY-MM-DD format'],
     },
     status: {
       type: String,
@@ -133,6 +135,10 @@ const jobSchema = new mongoose.Schema(
     estimatedCost: {
       type: Number,
       min: 0,
+    },
+    jobType: {
+      type: String,
+      trim: true,
     },
     actualCost: {
       type: Number,
@@ -158,5 +164,6 @@ const jobSchema = new mongoose.Schema(
 jobSchema.index({ status: 1, assignedTechnician: 1 });
 jobSchema.index({ createdAt: -1 });
 jobSchema.index({ scheduledDate: 1 });
+jobSchema.index({ jobType: 1 });
 
 module.exports = mongoose.model('Job', jobSchema);
