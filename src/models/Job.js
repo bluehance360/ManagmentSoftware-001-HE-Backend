@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const { JOB_STATUS } = require('../config/constants');
+const { DATE_ONLY_RE } = require('../utils/dateOnly');
 
 // Sub-schema for status history
 const statusHistorySchema = new mongoose.Schema(
@@ -112,7 +113,8 @@ const jobSchema = new mongoose.Schema(
       trim: true,
     },
     scheduledDate: {
-      type: Date,
+      type: String,
+      match: [DATE_ONLY_RE, 'scheduledDate must be in YYYY-MM-DD format'],
     },
     status: {
       type: String,

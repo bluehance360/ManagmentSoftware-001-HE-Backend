@@ -9,6 +9,7 @@ const Customer = require('../models/Customer');
 const TechTimeout = require('../models/TechTimeout');
 const { createNotification } = require('../services/NotificationService');
 const { getIO } = require('../socket');
+const { normalizeDateOnly, isDateOnly, toLocalDateOnly } = require('../utils/dateOnly');
 const {
   buildDocumentKey,
   getUploadUrl,
@@ -44,6 +45,17 @@ function canAccessJob(user, job) {
 
 function normalizeDocNote(note) {
   return typeof note === 'string' ? note.trim() : '';
+}
+
+function validateScheduledDate(value) {
+  const normalized = normalizeDateOnly(value);
+  if (!isDateOnly(normalized)) {
+    throw new Error('Invalid date format. Use YYYY-MM-DD');
+  }
+  if (normalized < toLocalDateOnly()) {
+    throw new Error('Scheduled date cannot be in the past');
+  }
+  return true;
 }
 
 router.use(authenticate);
@@ -167,13 +179,7 @@ router.post(
   [
     body('title').notEmpty().withMessage('Job title is required'),
     body('customerId').notEmpty().withMessage('Customer is required').isMongoId().withMessage('Invalid customer ID'),
-    body('scheduledDate').notEmpty().withMessage('Scheduled date is required').isISO8601().withMessage('Invalid date format')
-      .custom((value) => {
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        if (new Date(value) < today) throw new Error('Scheduled date cannot be in the past');
-        return true;
-      }),
+    body('scheduledDate').notEmpty().withMessage('Scheduled date is required').custom(validateScheduledDate),
     body('estimatedCost').optional().isFloat({ min: 0 }).withMessage('Must be a positive number'),
     body('companyName').optional().trim(),
   ],
@@ -768,13 +774,7 @@ router.put(
   [
     body('title').optional().notEmpty().withMessage('Title cannot be empty'),
     body('customerEmail').optional().isEmail().withMessage('Invalid customer email'),
-    body('scheduledDate').optional().isISO8601().withMessage('Invalid date format')
-      .custom((value) => {
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        if (new Date(value) < today) throw new Error('Scheduled date cannot be in the past');
-        return true;
-      }),
+    body('scheduledDate').optional().custom(validateScheduledDate),
     body('estimatedCost').optional().isFloat({ min: 0 }).withMessage('Must be positive'),
     body('actualCost').optional().isFloat({ min: 0 }).withMessage('Must be positive'),
   ],

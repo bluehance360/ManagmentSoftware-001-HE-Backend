@@ -7,21 +7,24 @@ const { authenticate, authorize } = require('../middleware/auth');
 const { ROLES, JOB_STATUS } = require('../config/constants');
 const { createNotification } = require('../services/NotificationService');
 const { getIO } = require('../socket');
+const {
+  normalizeDateOnly,
+  isDateOnly,
+  formatDateOnly,
+} = require('../utils/dateOnly');
 
 const router = express.Router();
 router.use(authenticate);
 
 // ── Helper: get unavailable technicians for a date ──────────────────
 async function getUnavailableTechs(date) {
-  const day = new Date(date);
-  day.setHours(0, 0, 0, 0);
-  const dayEnd = new Date(day);
-  dayEnd.setHours(23, 59, 59, 999);
+  const day = normalizeDateOnly(date);
+  if (!isDateOnly(day)) return [];
 
   // 1) Techs with active jobs (ASSIGNED or IN_PROGRESS) on this date
   const activeJobs = await Job.find({
     status: { $in: [JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS] },
-    scheduledDate: { $gte: day, $lte: dayEnd },
+    scheduledDate: day,
     assignedTechnician: { $ne: null },
   })
     .populate('assignedTechnician', 'name email')
@@ -30,7 +33,7 @@ async function getUnavailableTechs(date) {
 
   // 2) Techs with timeout entries overlapping this date
   const timeouts = await TechTimeout.find({
-    startDate: { $lte: dayEnd },
+    startDate: { $lte: day },
     endDate: { $gte: day },
   })
     .populate('technician', 'name email')
@@ -75,12 +78,16 @@ router.get(
     try {
       const { date } = req.query;
       if (!date) return res.status(400).json({ success: false, error: 'date query param is required' });
+      const normalizedDate = normalizeDateOnly(date);
+      if (!isDateOnly(normalizedDate)) {
+        return res.status(400).json({ success: false, error: 'date must be in YYYY-MM-DD format' });
+      }
 
       const allTechs = await User.find({ role: ROLES.TECHNICIAN, isActive: true })
         .select('name email')
         .lean();
 
-      const unavailable = await getUnavailableTechs(date);
+      const unavailable = await getUnavailableTechs(normalizedDate);
       const unavailableIds = unavailable.map((u) => u.technician._id.toString());
 
       res.json({
@@ -146,8 +153,16 @@ router.get(
 router.post(
   '/',
   [
-    body('startDate').notEmpty().withMessage('Start date is required').isISO8601(),
-    body('endDate').optional({ values: 'falsy' }).isISO8601(),
+    body('startDate').notEmpty().withMessage('Start date is required').custom((value) => {
+      const normalized = normalizeDateOnly(value);
+      if (!isDateOnly(normalized)) throw new Error('Invalid startDate format. Use YYYY-MM-DD');
+      return true;
+    }),
+    body('endDate').optional({ values: 'falsy' }).custom((value) => {
+      const normalized = normalizeDateOnly(value);
+      if (!isDateOnly(normalized)) throw new Error('Invalid endDate format. Use YYYY-MM-DD');
+      return true;
+    }),
     body('reason').optional().trim(),
     body('technicianId').optional().isMongoId(),
   ],
@@ -176,10 +191,8 @@ router.post(
         }
       }
 
-      const start = new Date(req.body.startDate);
-      start.setHours(0, 0, 0, 0);
-      const end = req.body.endDate ? new Date(req.body.endDate) : new Date(start);
-      end.setHours(23, 59, 59, 999);
+      const start = normalizeDateOnly(req.body.startDate);
+      const end = normalizeDateOnly(req.body.endDate) || start;
 
       if (end < start) {
         return res.status(400).json({ success: false, error: 'End date must be on or after start date' });
@@ -193,10 +206,10 @@ router.post(
       });
 
       // Notify admin and manager
-      const startStr = start.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-      const endStr = end.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      const startStr = formatDateOnly(start);
+      const endStr = formatDateOnly(end);
 
-      const isSingleDay = start.toDateString() === end.toDateString();
+      const isSingleDay = start === end;
       const message = isSingleDay
         ? `${techName} is not available on ${startStr}.`
         : `${techName} is not available from ${startStr} to ${endStr}.`;
