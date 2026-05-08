@@ -56,13 +56,21 @@ router.get(
 
       // Attach active job info so the frontend can show a "Busy" indicator
       const activeJobs = await Job.find({
-        assignedTechnician: { $in: technicians.map((t) => t._id) },
+        $or: [
+          { assignedTechnician: { $in: technicians.map((t) => t._id) } },
+          { secondaryAssignedTechnician: { $in: technicians.map((t) => t._id) } },
+        ],
         status: { $in: [JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS] },
-      }).select('assignedTechnician title status').lean();
+      }).select('assignedTechnician secondaryAssignedTechnician title status').lean();
 
       const activeJobMap = {};
       for (const j of activeJobs) {
-        activeJobMap[j.assignedTechnician.toString()] = { title: j.title, status: j.status };
+        if (j.assignedTechnician) {
+          activeJobMap[j.assignedTechnician.toString()] = { title: j.title, status: j.status };
+        }
+        if (j.secondaryAssignedTechnician) {
+          activeJobMap[j.secondaryAssignedTechnician.toString()] = { title: j.title, status: j.status };
+        }
       }
 
       const enriched = technicians.map((t) => ({

@@ -263,7 +263,7 @@ The platform is configured through secure environment variables:
 ```
 MONGODB_URI - Database connection string
 JWT_SECRET - Authentication secret key
-PORT - Service port (default: 5000)
+PORT - Service port (default: 5001)
 NODE_ENV - Environment (production/development)
 CORS_ORIGIN - Allowed frontend origins
 ```

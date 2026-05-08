@@ -32,6 +32,11 @@ const statusHistorySchema = new mongoose.Schema(
       ref: 'User',
       default: null,
     },
+    assignmentChecklist: {
+      firstPageReceived: { type: Boolean, default: false },
+      printsDrawingsReceived: { type: Boolean, default: false },
+      siteContactInfoReceived: { type: Boolean, default: false },
+    },
   },
   { _id: true }
 );
@@ -125,6 +130,11 @@ const jobSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
     },
+    secondaryAssignedTechnician: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
@@ -139,6 +149,16 @@ const jobSchema = new mongoose.Schema(
     jobType: {
       type: String,
       trim: true,
+    },
+    programmingSubtype: {
+      type: String,
+      enum: ['New Start-Up', 'Existing Start-Up'],
+      trim: true,
+    },
+    assignmentChecklist: {
+      firstPageReceived: { type: Boolean, default: false },
+      printsDrawingsReceived: { type: Boolean, default: false },
+      siteContactInfoReceived: { type: Boolean, default: false },
     },
     actualCost: {
       type: Number,

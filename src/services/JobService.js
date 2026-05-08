@@ -20,13 +20,20 @@ const { normalizeDateOnly, toLocalDateOnly } = require('../utils/dateOnly');
  * Check if a technician is unavailable on a given date.
  * Returns a reason string if unavailable, or null if available.
  */
-async function checkTechAvailability(technicianId, scheduledDate) {
+async function checkTechAvailability(technicianId, scheduledDate, excludeJobId = null) {
   // 1) Block if the tech already has any active job (ASSIGNED or IN_PROGRESS).
   // A technician must finish their current job before being assigned a new one.
-  const activeJob = await Job.findOne({
-    assignedTechnician: technicianId,
+  const activeJobQuery = {
+    $or: [
+      { assignedTechnician: technicianId },
+      { secondaryAssignedTechnician: technicianId },
+    ],
     status: { $in: [JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS] },
-  }).select('title status').lean();
+  };
+  if (excludeJobId) {
+    activeJobQuery._id = { $ne: excludeJobId };
+  }
+  const activeJob = await Job.findOne(activeJobQuery).select('title status').lean();
 
   if (activeJob) {
     return `Already has an active job: "${activeJob.title}" (${activeJob.status})`;
@@ -52,6 +59,7 @@ async function checkTechAvailability(technicianId, scheduledDate) {
 
 const POPULATE_FIELDS = [
   { path: 'assignedTechnician', select: 'name email' },
+  { path: 'secondaryAssignedTechnician', select: 'name email' },
   { path: 'createdBy', select: 'name email' },
   { path: 'statusHistory.changedBy', select: 'name email role' },
   { path: 'statusHistory.technician', select: 'name email' },
@@ -93,6 +101,10 @@ async function createJob(data, userId) {
     description: data.description,
     scheduledDate: normalizedScheduledDate,
     jobType: typeof data.jobType === 'string' ? data.jobType.trim() : undefined,
+    programmingSubtype:
+      typeof data.programmingSubtype === 'string'
+        ? data.programmingSubtype.trim()
+        : undefined,
     estimatedCost: data.estimatedCost,
     notes: data.notes,
     createdBy: userId,
@@ -151,7 +163,9 @@ async function transitionStatus(jobId, newStatus, user, notes) {
 
   // 3) Technician must be the one assigned
   if (user.role === ROLES.TECHNICIAN) {
-    if (!job.assignedTechnician || job.assignedTechnician.toString() !== user._id.toString()) {
+    const isPrimary = job.assignedTechnician?.toString() === user._id.toString();
+    const isSecondary = job.secondaryAssignedTechnician?.toString() === user._id.toString();
+    if (!isPrimary && !isSecondary) {
       return { error: 'You are not assigned to this job', status: 403 };
     }
   }
@@ -194,7 +208,14 @@ async function transitionStatus(jobId, newStatus, user, notes) {
  * Assign a technician (CONFIRMED → ASSIGNED) atomically.
  * Notes are required so the manager provides assignment instructions.
  */
-async function assignTechnician(jobId, technicianId, user, notes) {
+async function assignTechnician(
+  jobId,
+  technicianId,
+  user,
+  notes,
+  assignmentChecklist = {},
+  secondaryTechnicianId = null
+) {
   const jobForSchedule = await Job.findById(jobId).select('scheduledDate').lean();
   if (!jobForSchedule) return { error: 'Job not found', status: 404 };
 
@@ -203,6 +224,17 @@ async function assignTechnician(jobId, technicianId, user, notes) {
   if (!technician) return { error: 'Technician not found', status: 404 };
   if (technician.role !== ROLES.TECHNICIAN) {
     return { error: 'User is not a technician', status: 400 };
+  }
+  let secondaryTechnician = null;
+  if (secondaryTechnicianId) {
+    if (secondaryTechnicianId.toString() === technicianId.toString()) {
+      return { error: 'Primary and secondary technicians must be different', status: 400 };
+    }
+    secondaryTechnician = await User.findById(secondaryTechnicianId);
+    if (!secondaryTechnician) return { error: 'Secondary technician not found', status: 404 };
+    if (secondaryTechnician.role !== ROLES.TECHNICIAN) {
+      return { error: 'Secondary user is not a technician', status: 400 };
+    }
   }
 
   // 2) Notes are required when assigning
@@ -224,8 +256,26 @@ async function assignTechnician(jobId, technicianId, user, notes) {
       status: 400,
     };
   }
+  if (secondaryTechnicianId) {
+    const secondaryUnavailReason = await checkTechAvailability(
+      secondaryTechnicianId,
+      jobForSchedule.scheduledDate
+    );
+    if (secondaryUnavailReason) {
+      return {
+        error: `Secondary technician ${secondaryTechnician.name} is unavailable: ${secondaryUnavailReason}`,
+        status: 400,
+      };
+    }
+  }
 
   // 3) Atomic: only matches if status is still CONFIRMED
+  const checklist = {
+    firstPageReceived: Boolean(assignmentChecklist?.firstPageReceived),
+    printsDrawingsReceived: Boolean(assignmentChecklist?.printsDrawingsReceived),
+    siteContactInfoReceived: Boolean(assignmentChecklist?.siteContactInfoReceived),
+  };
+
   const historyEntry = {
     _id: new mongoose.Types.ObjectId(),
     fromStatus: JOB_STATUS.CONFIRMED,
@@ -234,6 +284,7 @@ async function assignTechnician(jobId, technicianId, user, notes) {
     technician: technicianId,
     changedAt: new Date(),
     notes: notes || `Assigned to ${technician.name}`,
+    assignmentChecklist: checklist,
   };
 
   const updated = await Job.findOneAndUpdate(
@@ -242,6 +293,8 @@ async function assignTechnician(jobId, technicianId, user, notes) {
       $set: {
         status: JOB_STATUS.ASSIGNED,
         assignedTechnician: technicianId,
+        secondaryAssignedTechnician: secondaryTechnicianId || null,
+        assignmentChecklist: checklist,
       },
       $push: { statusHistory: historyEntry },
     },
@@ -315,6 +368,7 @@ async function revertStatus(jobId, user) {
   // Reverting FROM ASSIGNED clears the technician so it can be reassigned cleanly
   if (job.status === JOB_STATUS.ASSIGNED) {
     $set.assignedTechnician = null;
+    $set.secondaryAssignedTechnician = null;
   }
   // Clear timestamp fields when stepping back past them
   if (job.status === JOB_STATUS.COMPLETED) $set.completedAt = null;

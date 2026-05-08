@@ -35,8 +35,27 @@ const TECH_VISIBLE_STATUSES = [
   JOB_STATUS.CLOSED,
 ];
 
+const PROGRAMMING_JOB_TYPES = new Set([
+  'leviton',
+  'crestron',
+  'lutron',
+  'nlight',
+  'wattstopper',
+]);
+
+const PROGRAMMING_SUBTYPES = ['New Start-Up', 'Existing Start-Up'];
+
 function normalizeJobType(value) {
   return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
+}
+
+function normalizeProgrammingSubtype(value) {
+  return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
+}
+
+function isProgrammingJobType(value) {
+  const normalized = normalizeJobType(value).toLowerCase();
+  return PROGRAMMING_JOB_TYPES.has(normalized);
 }
 
 async function ensureJobTypeSaved(name) {
@@ -93,8 +112,10 @@ function canAccessJob(user, job) {
   if ([ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(user.role)) return true;
   if (user.role !== ROLES.TECHNICIAN) return false;
   if (!TECH_VISIBLE_STATUSES.includes(job.status)) return false;
-  const techId = job.assignedTechnician?._id || job.assignedTechnician;
-  return techId?.toString() === user._id.toString();
+  const primaryTechId = job.assignedTechnician?._id || job.assignedTechnician;
+  const secondaryTechId = job.secondaryAssignedTechnician?._id || job.secondaryAssignedTechnician;
+  const userId = user._id.toString();
+  return primaryTechId?.toString() === userId || secondaryTechId?.toString() === userId;
 }
 
 function normalizeDocNote(note) {
@@ -112,6 +133,16 @@ function validateScheduledDate(value) {
   return true;
 }
 
+function formatRoleLabel(role) {
+  if (!role) return 'User';
+  if (role === ROLES.OFFICE_MANAGER) return 'Office Manager';
+  return role.charAt(0).toUpperCase() + role.slice(1).toLowerCase();
+}
+
+function actorWithRole(user) {
+  return `${user.name} (${formatRoleLabel(user.role)})`;
+}
+
 router.use(authenticate);
 
 // ── GET /api/jobs ────────────────────────────────────────────────────
@@ -121,7 +152,10 @@ router.get('/', async (req, res) => {
     const filter = {};
 
     if (req.user.role === ROLES.TECHNICIAN) {
-      filter.assignedTechnician = req.user._id;
+      filter.$or = [
+        { assignedTechnician: req.user._id },
+        { secondaryAssignedTechnician: req.user._id },
+      ];
       // Technicians see all assigned jobs immediately
       const techVisibleStatuses = [
         JOB_STATUS.ASSIGNED,
@@ -164,6 +198,7 @@ router.get('/', async (req, res) => {
     const [jobs, total] = await Promise.all([
       Job.find(filter)
         .populate('assignedTechnician', 'name email')
+        .populate('secondaryAssignedTechnician', 'name email')
         .populate('createdBy', 'name email')
         .populate('customer', 'name phone email address')
         .sort({ createdAt: -1 })
@@ -270,6 +305,7 @@ router.get('/:id', async (req, res) => {
   try {
     const job = await Job.findById(req.params.id)
       .populate('assignedTechnician', 'name email')
+      .populate('secondaryAssignedTechnician', 'name email')
       .populate('createdBy', 'name email')
       .populate('customer', 'name phone email address')
       .populate('statusHistory.changedBy', 'name email role')
@@ -296,7 +332,9 @@ router.get('/:id', async (req, res) => {
       if (!techVisibleStatuses.includes(job.status)) {
         return res.status(403).json({ success: false, error: 'Not authorized to view this job' });
       }
-      if (job.assignedTechnician?._id.toString() !== req.user._id.toString()) {
+      const primaryTechId = job.assignedTechnician?._id?.toString();
+      const secondaryTechId = job.secondaryAssignedTechnician?._id?.toString();
+      if (primaryTechId !== req.user._id.toString() && secondaryTechId !== req.user._id.toString()) {
         return res.status(403).json({ success: false, error: 'Not authorized to view this job' });
       }
     }
@@ -315,6 +353,7 @@ router.post(
     body('title').notEmpty().withMessage('Job title is required'),
     body('customerId').notEmpty().withMessage('Customer is required').isMongoId().withMessage('Invalid customer ID'),
     body('jobType').notEmpty().withMessage('Job type is required').isString().withMessage('Job type must be a string'),
+    body('programmingSubtype').optional().isString().withMessage('Programming subtype must be a string'),
     body('scheduledDate').notEmpty().withMessage('Scheduled date is required').custom(validateScheduledDate),
     body('estimatedCost').optional().isFloat({ min: 0 }).withMessage('Must be a positive number'),
     body('companyName').optional().trim(),
@@ -336,6 +375,23 @@ router.post(
       if (!req.body.jobType) {
         return res.status(400).json({ success: false, error: 'Job type is required' });
       }
+      req.body.programmingSubtype = normalizeProgrammingSubtype(req.body.programmingSubtype);
+      if (isProgrammingJobType(req.body.jobType)) {
+        if (!req.body.programmingSubtype) {
+          return res.status(400).json({
+            success: false,
+            error: 'Programming subtype is required for selected job type',
+          });
+        }
+        if (!PROGRAMMING_SUBTYPES.includes(req.body.programmingSubtype)) {
+          return res.status(400).json({
+            success: false,
+            error: 'Invalid programming subtype',
+          });
+        }
+      } else {
+        req.body.programmingSubtype = undefined;
+      }
       await ensureJobTypeSaved(req.body.jobType);
 
       const job = await JobService.createJob(req.body, req.user._id);
@@ -343,7 +399,7 @@ router.post(
       // Notify admins and managers
       createNotification({
         type: 'JOB_CREATED',
-        message: `New job created by ${req.user.name}: "${job.title}" for ${customer.name}`,
+        message: `New job created by ${actorWithRole(req.user)}: "${job.title}" for ${customer.name}`,
         jobId: job._id,
         recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,
@@ -374,7 +430,7 @@ router.post(
     }
 
     try {
-      const job = await Job.findById(req.params.id).select('_id title status assignedTechnician');
+      const job = await Job.findById(req.params.id).select('_id title status assignedTechnician secondaryAssignedTechnician');
       if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
       if (!canAccessJob(req.user, job)) {
         return res.status(403).json({ success: false, error: 'Not authorized to upload documents for this job' });
@@ -436,7 +492,7 @@ router.post(
 
     try {
       const job = await Job.findById(req.params.id)
-        .select('_id title status assignedTechnician documents')
+        .select('_id title status assignedTechnician secondaryAssignedTechnician documents')
         .populate('assignedTechnician', 'name email');
 
       if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
@@ -471,11 +527,12 @@ router.post(
       const latest = job.documents.slice(-createdDocs.length);
       const firstFile = latest[0]?.fileName || 'document';
       const message = latest.length === 1
-        ? `${req.user.name} uploaded "${firstFile}" to job "${job.title}"`
-        : `${req.user.name} uploaded ${latest.length} documents to job "${job.title}"`;
+        ? `${actorWithRole(req.user)} uploaded "${firstFile}" to job "${job.title}"`
+        : `${actorWithRole(req.user)} uploaded ${latest.length} documents to job "${job.title}"`;
 
       const recipientIds = [];
       if (job.assignedTechnician?._id) recipientIds.push(job.assignedTechnician._id);
+      if (job.secondaryAssignedTechnician) recipientIds.push(job.secondaryAssignedTechnician);
 
       createNotification({
         type: 'JOB_DOCUMENT_UPLOADED',
@@ -499,7 +556,7 @@ router.post(
 router.get('/:id/documents/:docId/url', async (req, res) => {
   try {
     const job = await Job.findById(req.params.id)
-      .select('_id status assignedTechnician documents');
+      .select('_id status assignedTechnician secondaryAssignedTechnician documents');
 
     if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
     if (!canAccessJob(req.user, job)) {
@@ -533,7 +590,7 @@ router.get('/:id/documents/:docId/url', async (req, res) => {
 router.delete('/:id/documents/:docId', async (req, res) => {
   try {
     const job = await Job.findById(req.params.id)
-      .select('_id title status assignedTechnician documents')
+      .select('_id title status assignedTechnician secondaryAssignedTechnician documents')
       .populate('assignedTechnician', 'name email');
 
     if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
@@ -562,8 +619,9 @@ router.delete('/:id/documents/:docId', async (req, res) => {
     // Notify admins/managers + assigned tech
     const recipientIds = [];
     if (job.assignedTechnician?._id) recipientIds.push(job.assignedTechnician._id);
+    if (job.secondaryAssignedTechnician) recipientIds.push(job.secondaryAssignedTechnician);
 
-    let message = `${req.user.name} deleted "${fileName}" from job "${job.title}"`;
+    let message = `${actorWithRole(req.user)} deleted "${fileName}" from job "${job.title}"`;
     if (reason) message += ` — Reason: ${reason}`;
 
     createNotification({
@@ -633,9 +691,10 @@ router.patch(
         if (actorIsAdmin && techName) {
      
           STATUS_MESSAGES[req.body.status] =
-            `"${job.title}" marked as ${statusLabel} by ${req.user.name} on behalf of ${techName}`;
+            `"${job.title}" marked as ${statusLabel} on behalf of ${techName}`;
           // Notify the assigned tech
-          notifRecipientIds.push(job.assignedTechnician._id);
+          if (job.assignedTechnician?._id) notifRecipientIds.push(job.assignedTechnician._id);
+          if (job.secondaryAssignedTechnician?._id) notifRecipientIds.push(job.secondaryAssignedTechnician._id);
         }
         // Notify admins and managers
         notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
@@ -650,7 +709,7 @@ router.patch(
 
       createNotification({
         type: `JOB_${req.body.status === 'IN_PROGRESS' ? 'STARTED' : req.body.status}`,
-        message: `${STATUS_MESSAGES[req.body.status] || `Job "${job.title}" status updated`} by ${req.user.name}`,
+        message: `${STATUS_MESSAGES[req.body.status] || `Job "${job.title}" status updated`} by ${actorWithRole(req.user)}`,
         jobId: job._id,
         recipientIds: notifRecipientIds,
         recipientRoles: notifRoles,
@@ -671,7 +730,12 @@ router.patch(
   authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   [
     body('technicianId').isMongoId().withMessage('Valid technician ID required'),
+    body('secondaryTechnicianId').optional({ values: 'falsy' }).isMongoId().withMessage('Valid secondary technician ID required'),
     body('notes').optional().isString(),
+    body('assignmentChecklist').optional().isObject().withMessage('Assignment checklist must be an object'),
+    body('assignmentChecklist.firstPageReceived').optional().isBoolean().withMessage('firstPageReceived must be true or false'),
+    body('assignmentChecklist.printsDrawingsReceived').optional().isBoolean().withMessage('printsDrawingsReceived must be true or false'),
+    body('assignmentChecklist.siteContactInfoReceived').optional().isBoolean().withMessage('siteContactInfoReceived must be true or false'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -684,7 +748,9 @@ router.patch(
         req.params.id,
         req.body.technicianId,
         req.user,
-        req.body.notes
+        req.body.notes,
+        req.body.assignmentChecklist,
+        req.body.secondaryTechnicianId || null
       );
 
       if (result.error) {
@@ -695,15 +761,24 @@ router.patch(
       const assignedJob = result.data;
       createNotification({
         type: 'JOB_ASSIGNED',
-        message: `Job "${assignedJob.title}" has been assigned to you by ${req.user.name}. Instructions: ${req.body.notes}`,
+        message: `Job "${assignedJob.title}" has been assigned to you by ${actorWithRole(req.user)}. Instructions: ${req.body.notes}`,
         jobId: assignedJob._id,
         recipientIds: [req.body.technicianId],
         excludeUserId: req.user._id,
       });
+      if (req.body.secondaryTechnicianId) {
+        createNotification({
+          type: 'JOB_ASSIGNED',
+          message: `Job "${assignedJob.title}" has been assigned to you as Secondary Technician by ${actorWithRole(req.user)}. Instructions: ${req.body.notes}`,
+          jobId: assignedJob._id,
+          recipientIds: [req.body.secondaryTechnicianId],
+          excludeUserId: req.user._id,
+        });
+      }
       // Also notify admins and managers
       createNotification({
         type: 'JOB_ASSIGNED',
-        message: `Job "${assignedJob.title}" has been assigned to ${assignedJob.assignedTechnician?.name || 'a technician'} by ${req.user.name}`,
+        message: `Job "${assignedJob.title}" has been assigned to ${assignedJob.assignedTechnician?.name || 'a technician'}${assignedJob.secondaryAssignedTechnician?.name ? ` and ${assignedJob.secondaryAssignedTechnician.name}` : ''} by ${actorWithRole(req.user)}`,
         jobId: assignedJob._id,
         recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,
@@ -723,6 +798,7 @@ router.patch(
   authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   [
     body('technicianId').isMongoId().withMessage('Valid technician ID required'),
+    body('secondaryTechnicianId').optional({ values: 'falsy' }).isMongoId().withMessage('Valid secondary technician ID required'),
     body('notes').optional().isString(),
   ],
   async (req, res) => {
@@ -733,7 +809,8 @@ router.patch(
 
     try {
       const job = await Job.findById(req.params.id)
-        .populate('assignedTechnician', 'name email');
+        .populate('assignedTechnician', 'name email')
+        .populate('secondaryAssignedTechnician', 'name email');
 
       if (!job) {
         return res.status(404).json({ success: false, error: 'Job not found' });
@@ -749,12 +826,29 @@ router.patch(
       }
 
       const oldTechId = job.assignedTechnician?._id?.toString();
+      const oldSecondaryTechId = job.secondaryAssignedTechnician?._id?.toString();
       const oldTechName = job.assignedTechnician?.name || 'previous technician';
+      const oldSecondaryTechName = job.secondaryAssignedTechnician?.name || '';
       const previousStatus = job.status;
+      const nextTechId = req.body.technicianId.toString();
+      const nextSecondaryTechId = req.body.secondaryTechnicianId
+        ? req.body.secondaryTechnicianId.toString()
+        : null;
+
+      if (nextSecondaryTechId && nextSecondaryTechId === nextTechId) {
+        return res.status(400).json({
+          success: false,
+          error: 'Primary and secondary technicians must be different',
+        });
+      }
 
       // Check new tech availability on scheduled date
       if (job.scheduledDate) {
-        const unavailReason = await JobService.checkTechAvailability(req.body.technicianId, job.scheduledDate);
+        const unavailReason = await JobService.checkTechAvailability(
+          req.body.technicianId,
+          job.scheduledDate,
+          job._id
+        );
         if (unavailReason) {
           const newTech = await User.findById(req.body.technicianId).select('name');
           return res.status(400).json({
@@ -762,14 +856,37 @@ router.patch(
             error: `Technician ${newTech?.name || ''} is unavailable on this date: ${unavailReason}`,
           });
         }
+        if (nextSecondaryTechId) {
+          const secondaryUnavailReason = await JobService.checkTechAvailability(
+            nextSecondaryTechId,
+            job.scheduledDate,
+            job._id
+          );
+          if (secondaryUnavailReason) {
+            const secondaryTech = await User.findById(nextSecondaryTechId).select('name');
+            return res.status(400).json({
+              success: false,
+              error: `Secondary technician ${secondaryTech?.name || ''} is unavailable on this date: ${secondaryUnavailReason}`,
+            });
+          }
+        }
       }
 
       // Fetch new technician's name
       const newTech = await User.findById(req.body.technicianId).select('name');
       const newTechName = newTech?.name || 'new technician';
+      let newSecondaryTechName = '';
+      if (nextSecondaryTechId) {
+        const newSecondaryTech = await User.findById(nextSecondaryTechId).select('name role');
+        if (!newSecondaryTech || newSecondaryTech.role !== ROLES.TECHNICIAN) {
+          return res.status(400).json({ success: false, error: 'Secondary technician not found' });
+        }
+        newSecondaryTechName = newSecondaryTech.name;
+      }
 
       // Update job: new technician, reset status to ASSIGNED
       job.assignedTechnician = req.body.technicianId;
+      job.secondaryAssignedTechnician = nextSecondaryTechId;
       job.status = JOB_STATUS.ASSIGNED;
       job.statusHistory.push({
         fromStatus: previousStatus,
@@ -781,20 +898,79 @@ router.patch(
 
       // Re-populate for response
       await job.populate('assignedTechnician', 'name email');
+      await job.populate('secondaryAssignedTechnician', 'name email');
       await job.populate('createdBy', 'name email');
 
-      // Notify the new technician immediately
-      createNotification({
-        type: 'JOB_REASSIGNED',
-        message: `Job "${job.title}" has been reassigned to you by ${req.user.name}`,
-        jobId: job._id,
-        recipientIds: [req.body.technicianId],
-        excludeUserId: req.user._id,
-      });
+      // Reassign notifications: notify only affected technicians.
+      // 1) Secondary changed -> notify new secondary + old secondary + unchanged primary
+      if (oldSecondaryTechId !== nextSecondaryTechId) {
+        if (nextSecondaryTechId) {
+          createNotification({
+            type: 'JOB_REASSIGNED',
+            message: `You have been assigned to this job as the secondary technician. The primary technician is ${newTechName}.${req.body.notes ? ` Assignment note: ${req.body.notes}` : ''}`,
+            jobId: job._id,
+            recipientIds: [nextSecondaryTechId],
+            excludeUserId: req.user._id,
+          });
+        }
+        if (oldSecondaryTechId && oldSecondaryTechId !== nextTechId) {
+          createNotification({
+            type: 'JOB_REASSIGNED',
+            message: `You have been unassigned from ${job.title}.`,
+            jobId: job._id,
+            recipientIds: [oldSecondaryTechId],
+            excludeUserId: req.user._id,
+          });
+        }
+        if (oldTechId && oldTechId === nextTechId && oldSecondaryTechName) {
+          const secondaryChangeMessage = newSecondaryTechName
+            ? `The secondary technician for this job has been changed from ${oldSecondaryTechName} to ${newSecondaryTechName}.`
+            : `Secondary tech ${oldSecondaryTechName} is removed from job.`;
+          createNotification({
+            type: 'JOB_REASSIGNED',
+            message: `${secondaryChangeMessage}${req.body.notes ? ` Assignment note: ${req.body.notes}` : ''}`,
+            jobId: job._id,
+            recipientIds: [oldTechId],
+            excludeUserId: req.user._id,
+          });
+        }
+      }
+
+      // 2) Primary changed -> notify new primary + old primary + unchanged secondary
+      if (oldTechId !== nextTechId) {
+        const primaryContext = newSecondaryTechName
+          ? ` The secondary technician is ${newSecondaryTechName}.`
+          : '';
+        createNotification({
+          type: 'JOB_REASSIGNED',
+          message: `You have been assigned to this job as the primary technician.${primaryContext}${req.body.notes ? ` Assignment note: ${req.body.notes}` : ''}`,
+          jobId: job._id,
+          recipientIds: [nextTechId],
+          excludeUserId: req.user._id,
+        });
+        if (oldTechId && oldTechId !== nextSecondaryTechId) {
+          createNotification({
+            type: 'JOB_REASSIGNED',
+            message: `You have been unassigned from ${job.title}.`,
+            jobId: job._id,
+            recipientIds: [oldTechId],
+            excludeUserId: req.user._id,
+          });
+        }
+        if (oldSecondaryTechId && oldSecondaryTechId === nextSecondaryTechId && oldTechName) {
+          createNotification({
+            type: 'JOB_REASSIGNED',
+            message: `The primary technician for this job has been changed from ${oldTechName} to ${newTechName}.${req.body.notes ? ` Assignment note: ${req.body.notes}` : ''}`,
+            jobId: job._id,
+            recipientIds: [oldSecondaryTechId],
+            excludeUserId: req.user._id,
+          });
+        }
+      }
       // Also notify admins and managers
       createNotification({
         type: 'JOB_REASSIGNED',
-        message: `Job "${job.title}" reassigned from ${oldTechName} to ${newTechName} by ${req.user.name}`,
+        message: `Job "${job.title}" reassigned from ${oldTechName}${oldSecondaryTechName ? ` + ${oldSecondaryTechName}` : ''} to ${newTechName}${newSecondaryTechName ? ` + ${newSecondaryTechName}` : ''} by ${actorWithRole(req.user)}.${req.body.notes ? ` Notes: ${req.body.notes}` : ''}`,
         jobId: job._id,
         recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,
@@ -808,19 +984,72 @@ router.patch(
   }
 );
 
+// ── PATCH /api/jobs/:id/assignment-checklist (ADMIN, OFFICE_MANAGER) ──
+router.patch(
+  '/:id/assignment-checklist',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  [
+    body('firstPageReceived').optional().isBoolean().withMessage('firstPageReceived must be true or false'),
+    body('printsDrawingsReceived').optional().isBoolean().withMessage('printsDrawingsReceived must be true or false'),
+    body('siteContactInfoReceived').optional().isBoolean().withMessage('siteContactInfoReceived must be true or false'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const job = await Job.findById(req.params.id);
+      if (!job) {
+        return res.status(404).json({ success: false, error: 'Job not found' });
+      }
+
+      const nextChecklist = {
+        firstPageReceived: Boolean(req.body.firstPageReceived ?? job.assignmentChecklist?.firstPageReceived),
+        printsDrawingsReceived: Boolean(req.body.printsDrawingsReceived ?? job.assignmentChecklist?.printsDrawingsReceived),
+        siteContactInfoReceived: Boolean(req.body.siteContactInfoReceived ?? job.assignmentChecklist?.siteContactInfoReceived),
+      };
+
+      job.assignmentChecklist = nextChecklist;
+      for (let i = job.statusHistory.length - 1; i >= 0; i -= 1) {
+        if (job.statusHistory[i]?.toStatus === JOB_STATUS.ASSIGNED) {
+          job.statusHistory[i].assignmentChecklist = nextChecklist;
+          break;
+        }
+      }
+      await job.save();
+      await job.populate('assignedTechnician', 'name email');
+      await job.populate('secondaryAssignedTechnician', 'name email');
+      await job.populate('createdBy', 'name email');
+
+      broadcastJobUpdate();
+      res.json({ success: true, data: job, message: 'Assignment checklist updated' });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
 // ── PATCH /api/jobs/:id/revert (ADMIN, OFFICE_MANAGER) ─────────────
 router.patch(
   '/:id/revert',
   authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   async (req, res) => {
     try {
+      const beforeRevertJob = await Job.findById(req.params.id)
+        .select('assignedTechnician secondaryAssignedTechnician status title')
+        .lean();
+
       const result = await JobService.revertStatus(req.params.id, req.user);
       if (result.error) {
         return res.status(result.status).json({ success: false, error: result.error });
       }
 
       const job = result.data;
-      const message = `Job "${job.title}" status reverted from ${result.revertedFrom} to ${result.revertedTo} by ${req.user.name}`;
+      const message = `Job "${job.title}" status reverted from ${result.revertedFrom} to ${result.revertedTo} by ${actorWithRole(req.user)}`;
+      const previousAssignedTechId = beforeRevertJob?.assignedTechnician?.toString();
+      const previousSecondaryAssignedTechId = beforeRevertJob?.secondaryAssignedTechnician?.toString();
 
       // Notify the assigned technician only if the revert involves statuses visible to them
       // (PAID/CLOSED are hidden from techs, so don't notify them when reverting those)
@@ -831,6 +1060,28 @@ router.patch(
           message,
           jobId: job._id,
           recipientIds: [job.assignedTechnician._id],
+          excludeUserId: req.user._id,
+        });
+      }
+      if (result.revertedFrom === JOB_STATUS.ASSIGNED && previousAssignedTechId) {
+        createNotification({
+          type: 'JOB_UPDATED',
+          message: `Job "${job.title}" was reverted from ASSIGNED to CONFIRMED by ${actorWithRole(req.user)}. You have been unassigned.`,
+          jobId: job._id,
+          recipientIds: [previousAssignedTechId],
+          excludeUserId: req.user._id,
+        });
+      }
+      if (
+        result.revertedFrom === JOB_STATUS.ASSIGNED &&
+        previousSecondaryAssignedTechId &&
+        previousSecondaryAssignedTechId !== previousAssignedTechId
+      ) {
+        createNotification({
+          type: 'JOB_UPDATED',
+          message: `Job "${job.title}" was reverted from ASSIGNED to CONFIRMED by ${actorWithRole(req.user)}. You have been unassigned.`,
+          jobId: job._id,
+          recipientIds: [previousSecondaryAssignedTechId],
           excludeUserId: req.user._id,
         });
       }
@@ -874,6 +1125,7 @@ router.delete(
 
       const jobTitle = job.title;
       const techId = job.assignedTechnician?._id;
+      const secondaryTechId = job.secondaryAssignedTechnician?._id;
 
       await Job.findByIdAndDelete(req.params.id);
 
@@ -886,6 +1138,9 @@ router.delete(
       if (techId && techVisibleStatuses.includes(job.status)) {
         notifRecipientIds.push(techId);
       }
+      if (secondaryTechId && techVisibleStatuses.includes(job.status)) {
+        notifRecipientIds.push(secondaryTechId);
+      }
 
       // Notify admins and managers (both can see all jobs including TENTATIVE)
       notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
@@ -893,7 +1148,7 @@ router.delete(
       if (notifRecipientIds.length > 0 || notifRoles.length > 0) {
         createNotification({
           type: 'JOB_DELETED',
-          message: `Job "${jobTitle}" has been deleted by ${req.user.name}`,
+          message: `Job "${jobTitle}" has been deleted by ${actorWithRole(req.user)}`,
           jobId: null,
           recipientIds: notifRecipientIds,
           recipientRoles: notifRoles,
@@ -957,10 +1212,13 @@ router.put(
       if (updatedJob.assignedTechnician && techVisible.includes(updatedJob.status)) {
         notifRecipientIds.push(updatedJob.assignedTechnician._id || updatedJob.assignedTechnician);
       }
+      if (updatedJob.secondaryAssignedTechnician && techVisible.includes(updatedJob.status)) {
+        notifRecipientIds.push(updatedJob.secondaryAssignedTechnician._id || updatedJob.secondaryAssignedTechnician);
+      }
 
       createNotification({
         type: 'JOB_UPDATED',
-        message: `Job "${updatedJob.title}" details have been updated by ${req.user.name}`,
+        message: `Job "${updatedJob.title}" details have been updated by ${actorWithRole(req.user)}`,
         jobId: updatedJob._id,
         recipientIds: notifRecipientIds,
         recipientRoles: notifRoles,
