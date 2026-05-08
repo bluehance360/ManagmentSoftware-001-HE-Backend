@@ -12,9 +12,45 @@
 const mongoose = require('mongoose');
 const Job = require('../models/Job');
 const User = require('../models/User');
+const JobType = require('../models/JobType');
 const TechTimeout = require('../models/TechTimeout');
 const { ROLES, JOB_STATUS, STATUS_TRANSITIONS } = require('../config/constants');
 const { normalizeDateOnly, toLocalDateOnly } = require('../utils/dateOnly');
+
+/**
+ * Look up the JobType doc matching a job's stored jobType name (case-insensitive).
+ * Returns null if not found in the JobType collection (e.g. legacy free-text type).
+ */
+async function findJobTypeByName(jobTypeName) {
+  if (!jobTypeName || typeof jobTypeName !== 'string') return null;
+  const normalized = jobTypeName.trim().toLowerCase();
+  if (!normalized) return null;
+  return JobType.findOne({ normalizedName: normalized }).lean();
+}
+
+/**
+ * If the job's type requires certification, ensure each technician id is certified.
+ * Returns an error string if any technician is missing the cert, otherwise null.
+ */
+async function ensureTechCertifiedForJobType(jobTypeName, technicianIds) {
+  const ids = (technicianIds || []).filter(Boolean);
+  if (!ids.length) return null;
+  const type = await findJobTypeByName(jobTypeName);
+  if (!type || !type.certificationRequired) return null;
+
+  const techs = await User.find({ _id: { $in: ids } })
+    .select('name certificates')
+    .lean();
+  for (const tech of techs) {
+    const hasCert = (tech.certificates || []).some(
+      (c) => c.jobTypeId?.toString() === type._id.toString()
+    );
+    if (!hasCert) {
+      return `Technician ${tech.name} is not certified for ${type.name}`;
+    }
+  }
+  return null;
+}
 
 /**
  * Check if a technician is unavailable on a given date.
@@ -216,7 +252,7 @@ async function assignTechnician(
   assignmentChecklist = {},
   secondaryTechnicianId = null
 ) {
-  const jobForSchedule = await Job.findById(jobId).select('scheduledDate').lean();
+  const jobForSchedule = await Job.findById(jobId).select('scheduledDate jobType').lean();
   if (!jobForSchedule) return { error: 'Job not found', status: 404 };
 
   // 1) Verify technician exists and has correct role
@@ -268,6 +304,13 @@ async function assignTechnician(
       };
     }
   }
+
+  // 2d) If the job type requires certification, both techs must be certified.
+  const certError = await ensureTechCertifiedForJobType(
+    jobForSchedule.jobType,
+    [technicianId, secondaryTechnicianId].filter(Boolean)
+  );
+  if (certError) return { error: certError, status: 400 };
 
   // 3) Atomic: only matches if status is still CONFIRMED
   const checklist = {
@@ -409,4 +452,6 @@ module.exports = {
   revertStatus,
   validateTransition,
   checkTechAvailability,
+  ensureTechCertifiedForJobType,
+  findJobTypeByName,
 };

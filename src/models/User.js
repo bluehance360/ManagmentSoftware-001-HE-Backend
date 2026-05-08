@@ -2,6 +2,33 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const { ROLES } = require('../config/constants');
 
+const certificateSchema = new mongoose.Schema(
+  {
+    jobTypeId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'JobType',
+      required: true,
+    },
+    jobTypeName: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    document: {
+      key: { type: String, required: true },
+      fileName: { type: String, required: true },
+      contentType: { type: String, default: 'application/octet-stream' },
+      size: { type: Number, default: 0 },
+    },
+    uploadedAt: { type: Date, default: Date.now },
+    uploadedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    },
+  },
+  { _id: true }
+);
+
 const userSchema = new mongoose.Schema(
   {
     email: {
@@ -30,6 +57,11 @@ const userSchema = new mongoose.Schema(
     isActive: {
       type: Boolean,
       default: true,
+    },
+    // Per-job-type certifications. One entry per certified jobTypeId.
+    certificates: {
+      type: [certificateSchema],
+      default: [],
     },
   },
   {

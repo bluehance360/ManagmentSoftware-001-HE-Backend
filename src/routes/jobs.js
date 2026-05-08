@@ -58,18 +58,23 @@ function isProgrammingJobType(value) {
   return PROGRAMMING_JOB_TYPES.has(normalized);
 }
 
-async function ensureJobTypeSaved(name) {
+async function ensureJobTypeSaved(name, { certificationRequired } = {}) {
   const normalizedName = normalizeJobType(name);
-  if (!normalizedName) return;
+  if (!normalizedName) return null;
 
-  await JobType.findOneAndUpdate(
+  // certificationRequired is immutable post-create. If a record already exists
+  // we keep its existing flag; only $setOnInsert applies on first creation.
+  const setOnInsert = {
+    name: normalizedName,
+    normalizedName: normalizedName.toLowerCase(),
+  };
+  if (typeof certificationRequired === 'boolean') {
+    setOnInsert.certificationRequired = certificationRequired;
+  }
+
+  return JobType.findOneAndUpdate(
     { normalizedName: normalizedName.toLowerCase() },
-    {
-      $setOnInsert: {
-        name: normalizedName,
-        normalizedName: normalizedName.toLowerCase(),
-      },
-    },
+    { $setOnInsert: setOnInsert },
     { upsert: true, new: true }
   );
 }
@@ -102,6 +107,7 @@ async function listJobTypesWithUsage() {
   return types.map((type) => ({
     _id: type._id,
     name: type.name,
+    certificationRequired: Boolean(type.certificationRequired),
     usageCount: usageMap.get(type.normalizedName)?.usageCount || 0,
     jobTitles: usageMap.get(type.normalizedName)?.jobTitles || [],
   }));
@@ -238,6 +244,7 @@ router.post(
   authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   [
     body('name').notEmpty().withMessage('Job type name is required').isString().withMessage('Job type name must be a string'),
+    body('certificationRequired').optional().isBoolean().withMessage('certificationRequired must be true or false'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -251,7 +258,9 @@ router.post(
         return res.status(400).json({ success: false, error: 'Job type name is required' });
       }
 
-      await ensureJobTypeSaved(normalizedName);
+      await ensureJobTypeSaved(normalizedName, {
+        certificationRequired: Boolean(req.body.certificationRequired),
+      });
       const jobTypes = await listJobTypesWithUsage();
       const created = jobTypes.find((item) => item.name.toLowerCase() === normalizedName.toLowerCase());
 
@@ -882,6 +891,15 @@ router.patch(
           return res.status(400).json({ success: false, error: 'Secondary technician not found' });
         }
         newSecondaryTechName = newSecondaryTech.name;
+      }
+
+      // Enforce certification requirement for cert-required job types
+      const reassignCertError = await JobService.ensureTechCertifiedForJobType(
+        job.jobType,
+        [req.body.technicianId, nextSecondaryTechId].filter(Boolean)
+      );
+      if (reassignCertError) {
+        return res.status(400).json({ success: false, error: reassignCertError });
       }
 
       // Update job: new technician, reset status to ASSIGNED

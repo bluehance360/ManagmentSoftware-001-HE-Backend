@@ -15,6 +15,13 @@ const jobTypeSchema = new mongoose.Schema(
       lowercase: true,
       unique: true,
     },
+    // Locked at creation time. Once persisted it cannot be changed; the only way
+    // to alter the cert requirement for a type is to delete and recreate it.
+    certificationRequired: {
+      type: Boolean,
+      default: false,
+      immutable: true,
+    },
   },
   { timestamps: false }
 );

@@ -125,7 +125,7 @@ router.get(
   authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   async (req, res) => {
     try {
-      const tech = await User.findById(req.params.id).select('name email role');
+      const tech = await User.findById(req.params.id).select('name email role certificates');
       if (!tech || tech.role !== ROLES.TECHNICIAN) {
         return res.status(404).json({ success: false, error: 'Technician not found' });
       }

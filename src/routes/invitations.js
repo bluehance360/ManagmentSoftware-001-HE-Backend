@@ -14,7 +14,7 @@ const router = express.Router();
 router.get(
   '/',
   authenticate,
-  authorize(ROLES.ADMIN),
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   async (req, res) => {
     try {
       const invitations = await Invitation.find({
