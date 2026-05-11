@@ -2,19 +2,117 @@ const express = require('express');
 const { body, validationResult } = require('express-validator');
 const TechTimeout = require('../models/TechTimeout');
 const Job = require('../models/Job');
+const Notification = require('../models/Notification');
 const User = require('../models/User');
 const { authenticate, authorize } = require('../middleware/auth');
-const { ROLES, JOB_STATUS } = require('../config/constants');
+const { ROLES, JOB_STATUS, TIMEOUT_REQUEST_STATUS } = require('../config/constants');
 const { createNotification } = require('../services/NotificationService');
-const { getIO } = require('../socket');
+const { emitToUsers, getIO } = require('../socket');
 const {
   normalizeDateOnly,
   isDateOnly,
+  toLocalDateOnly,
   formatDateOnly,
 } = require('../utils/dateOnly');
 
 const router = express.Router();
 router.use(authenticate);
+
+function roleLabel(role) {
+  if (role === ROLES.ADMIN) return 'Admin';
+  if (role === ROLES.OFFICE_MANAGER) return 'Office Manager';
+  if (role === ROLES.TECHNICIAN) return 'Technician';
+  return role || 'User';
+}
+
+function actorWithRole(user) {
+  return `${user.name} (${roleLabel(user.role)})`;
+}
+
+function formatTimeoutRange(start, end) {
+  return start === end
+    ? formatDateOnly(start)
+    : `${formatDateOnly(start)} to ${formatDateOnly(end)}`;
+}
+
+async function updateRequestNotifications({
+  timeoutId,
+  message,
+  timeoutStatus,
+  reviewMessage,
+  actorUserId,
+  reviewedByUser,
+  reason,
+  technicianId,
+  startDate,
+  endDate,
+}) {
+  const filter = {
+    type: 'TECH_TIMEOUT_REQUESTED',
+    'meta.timeoutRequestId': timeoutId.toString(),
+  };
+
+  const update = {
+    $set: {
+      message,
+      read: false,
+      'meta.timeoutStatus': timeoutStatus,
+      'meta.reason': reason,
+      'meta.technicianId': technicianId?.toString(),
+      'meta.startDate': startDate,
+      'meta.endDate': endDate,
+    },
+    $currentDate: {
+      updatedAt: true,
+    },
+  };
+
+  if (reviewMessage) {
+    update.$set['meta.reviewMessage'] = reviewMessage;
+  } else {
+    update.$unset = { 'meta.reviewMessage': 1 };
+  }
+
+  if (reviewedByUser) {
+    update.$set['meta.reviewedByName'] = reviewedByUser.name;
+    update.$set['meta.reviewedByRole'] = reviewedByUser.role;
+  } else {
+    update.$unset = {
+      ...(update.$unset || {}),
+      'meta.reviewedByName': 1,
+      'meta.reviewedByRole': 1,
+    };
+  }
+
+  await Notification.updateMany(filter, update);
+
+  if (actorUserId) {
+    await Notification.updateMany(
+      {
+        ...filter,
+        recipient: actorUserId,
+      },
+      {
+        $set: { read: true },
+      }
+    );
+  }
+}
+
+function emitJobUpdate() {
+  const io = getIO();
+  if (io) io.emit('jobs:updated');
+}
+
+function approvedTimeoutQuery(extra = {}) {
+  return {
+    ...extra,
+    $or: [
+      { status: TIMEOUT_REQUEST_STATUS.APPROVED },
+      { status: { $exists: false } },
+    ],
+  };
+}
 
 // ── Helper: get unavailable technicians for a date ──────────────────
 async function getUnavailableTechs(date) {
@@ -32,10 +130,10 @@ async function getUnavailableTechs(date) {
     .lean();
 
   // 2) Techs with timeout entries overlapping this date
-  const timeouts = await TechTimeout.find({
+  const timeouts = await TechTimeout.find(approvedTimeoutQuery({
     startDate: { $lte: day },
     endDate: { $gte: day },
-  })
+  }))
     .populate('technician', 'name email')
     .lean();
 
@@ -110,13 +208,51 @@ router.get(
 router.get('/my', async (req, res) => {
   try {
     const timeouts = await TechTimeout.find({ technician: req.user._id })
-      .sort({ startDate: -1 })
+      .sort({ createdAt: -1, startDate: -1 })
       .lean();
-    res.json({ success: true, data: timeouts });
+    res.json({
+      success: true,
+      data: timeouts.map((timeout) => ({
+        ...timeout,
+        status: timeout.status || TIMEOUT_REQUEST_STATUS.APPROVED,
+      })),
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+router.patch(
+  '/:id/request-list-dismiss',
+  authorize(ROLES.TECHNICIAN),
+  async (req, res) => {
+    try {
+      const timeout = await TechTimeout.findOneAndUpdate(
+        {
+          _id: req.params.id,
+          technician: req.user._id,
+          status: { $in: [TIMEOUT_REQUEST_STATUS.APPROVED, TIMEOUT_REQUEST_STATUS.REJECTED] },
+          requestListDismissedAt: { $exists: false },
+        },
+        {
+          $set: { requestListDismissedAt: new Date() },
+        },
+        { new: true }
+      );
+
+      if (!timeout) {
+        return res.status(404).json({
+          success: false,
+          error: 'Request item not found or cannot be removed from requests',
+        });
+      }
+
+      res.json({ success: true, message: 'Request removed from list', data: timeout });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
 
 // ── GET /api/tech-timeouts/technician/:id  ──────────────────────────
 // Admin/manager fetch a specific technician's timeouts + jobs
@@ -131,7 +267,9 @@ router.get(
       }
 
       const [timeouts, jobs] = await Promise.all([
-        TechTimeout.find({ technician: req.params.id }).sort({ startDate: -1 }).lean(),
+        TechTimeout.find(approvedTimeoutQuery({
+          technician: req.params.id,
+        })).sort({ startDate: -1 }).lean(),
         Job.find({ assignedTechnician: req.params.id })
           .populate('customer', 'name phone email address')
           .sort({ scheduledDate: -1 })
@@ -163,7 +301,7 @@ router.post(
       if (!isDateOnly(normalized)) throw new Error('Invalid endDate format. Use YYYY-MM-DD');
       return true;
     }),
-    body('reason').optional().trim(),
+    body('reason').optional({ values: 'falsy' }).trim(),
     body('technicianId').optional().isMongoId(),
   ],
   async (req, res) => {
@@ -193,39 +331,319 @@ router.post(
 
       const start = normalizeDateOnly(req.body.startDate);
       const end = normalizeDateOnly(req.body.endDate) || start;
+      const normalizedReason = req.body.reason?.trim() || undefined;
+      const createdByManager = [ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(req.user.role);
 
       if (end < start) {
         return res.status(400).json({ success: false, error: 'End date must be on or after start date' });
+      }
+
+      if (req.user.role === ROLES.TECHNICIAN) {
+        const blockingJob = await Job.findOne({
+          $and: [
+            {
+              $or: [
+                { assignedTechnician: req.user._id },
+                { secondaryAssignedTechnician: req.user._id },
+              ],
+            },
+            {
+              $or: [
+                { status: JOB_STATUS.IN_PROGRESS },
+                {
+                  status: JOB_STATUS.ASSIGNED,
+                  $or: [
+                    { scheduledDate: { $lte: end } },
+                    { scheduledDate: null },
+                    { scheduledDate: { $exists: false } },
+                  ],
+                },
+              ],
+            },
+          ],
+        })
+          .select('title scheduledDate status')
+          .lean();
+
+        if (blockingJob) {
+          return res.status(400).json({
+            success: false,
+            error: `You already have an active ${blockingJob.status.toLowerCase().replace('_', ' ')} job from ${formatDateOnly(blockingJob.scheduledDate)} for "${blockingJob.title}". Complete or reassign it before requesting timeout.`,
+          });
+        }
+      }
+
+      const overlappingTimeout = await TechTimeout.findOne({
+        technician: techId,
+        $or: [
+          { status: TIMEOUT_REQUEST_STATUS.PENDING },
+          { status: TIMEOUT_REQUEST_STATUS.APPROVED },
+          { status: { $exists: false } },
+        ],
+        startDate: { $lte: end },
+        endDate: { $gte: start },
+      }).lean();
+
+      if (overlappingTimeout) {
+        return res.status(400).json({
+          success: false,
+          error: 'A pending or approved timeout already overlaps those dates',
+        });
       }
 
       const timeout = await TechTimeout.create({
         technician: techId,
         startDate: start,
         endDate: end,
-        reason: req.body.reason || undefined,
+        reason: normalizedReason,
+        status: createdByManager ? TIMEOUT_REQUEST_STATUS.APPROVED : TIMEOUT_REQUEST_STATUS.PENDING,
+        reviewedBy: createdByManager ? req.user._id : undefined,
+        reviewedAt: createdByManager ? new Date() : undefined,
       });
 
-      // Notify admin and manager
-      const startStr = formatDateOnly(start);
-      const endStr = formatDateOnly(end);
+      const rangeLabel = formatTimeoutRange(start, end);
 
-      const isSingleDay = start === end;
-      const message = isSingleDay
-        ? `${techName} is not available on ${startStr}.`
-        : `${techName} is not available from ${startStr} to ${endStr}.`;
+      if (createdByManager) {
+        await createNotification({
+          type: 'TECH_TIMEOUT_APPROVED',
+          message: `A timeout was added for you for ${rangeLabel} by ${actorWithRole(req.user)}.`,
+          jobId: null,
+          recipientIds: [techId],
+          meta: {
+            timeoutRequestId: timeout._id.toString(),
+            timeoutStatus: TIMEOUT_REQUEST_STATUS.APPROVED,
+          },
+          excludeUserId: req.user._id,
+        });
 
-      createNotification({
-        type: 'TECH_TIMEOUT',
-        message,
+        emitJobUpdate();
+        return res.status(201).json({
+          success: true,
+          data: timeout,
+          message: 'Timeout created successfully',
+        });
+      }
+
+      await createNotification({
+        type: 'TECH_TIMEOUT_REQUESTED',
+        message: `${actorWithRole(req.user)} requested timeout for ${rangeLabel}.`,
         jobId: null,
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        meta: {
+          timeoutRequestId: timeout._id.toString(),
+          timeoutStatus: TIMEOUT_REQUEST_STATUS.PENDING,
+          technicianId: techId.toString(),
+          startDate: start,
+          endDate: end,
+          reason: normalizedReason,
+        },
+        excludeUserId: req.user._id,
+      });
+
+      res.status(201).json({
+        success: true,
+        data: timeout,
+        message: 'Timeout request submitted for approval',
+      });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── PATCH /api/tech-timeouts/:id/review  ───────────────────────────
+// Admin/manager approve or reject a technician timeout request
+router.patch(
+  '/:id/review',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  [
+    body('decision')
+      .isIn(['APPROVE', 'REJECT'])
+      .withMessage('decision must be APPROVE or REJECT'),
+    body('reviewMessage').optional({ values: 'falsy' }).trim(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const timeout = await TechTimeout.findById(req.params.id).populate('technician', 'name role');
+      if (!timeout) {
+        return res.status(404).json({ success: false, error: 'Timeout request not found' });
+      }
+
+      if (timeout.status !== TIMEOUT_REQUEST_STATUS.PENDING) {
+        return res.status(400).json({
+          success: false,
+          error: `This timeout request is already ${timeout.status.toLowerCase()}`,
+        });
+      }
+
+      const reviewMessage = req.body.reviewMessage?.trim() || undefined;
+      const rangeLabel = formatTimeoutRange(timeout.startDate, timeout.endDate);
+
+      if (req.body.decision === 'APPROVE') {
+        const overlappingApprovedTimeout = await TechTimeout.findOne({
+          _id: { $ne: timeout._id },
+          technician: timeout.technician._id,
+          $or: [
+            { status: TIMEOUT_REQUEST_STATUS.APPROVED },
+            { status: { $exists: false } },
+          ],
+          startDate: { $lte: timeout.endDate },
+          endDate: { $gte: timeout.startDate },
+        }).lean();
+
+        if (overlappingApprovedTimeout) {
+          return res.status(400).json({
+            success: false,
+            error: 'This request overlaps an already approved timeout',
+          });
+        }
+
+        timeout.status = TIMEOUT_REQUEST_STATUS.APPROVED;
+        timeout.reviewedBy = req.user._id;
+        timeout.reviewedAt = new Date();
+        timeout.reviewMessage = undefined;
+        await timeout.save();
+
+        const managerMessage = `${timeout.technician.name}'s timeout request for ${rangeLabel} was approved by ${actorWithRole(req.user)}.`;
+
+        await updateRequestNotifications({
+          timeoutId: timeout._id,
+          message: managerMessage,
+          timeoutStatus: TIMEOUT_REQUEST_STATUS.APPROVED,
+          actorUserId: req.user._id,
+          reviewedByUser: req.user,
+          reason: timeout.reason,
+          technicianId: timeout.technician._id,
+          startDate: timeout.startDate,
+          endDate: timeout.endDate,
+        });
+
+        await createNotification({
+          type: 'TECH_TIMEOUT_APPROVED',
+          message: `Your timeout request for ${rangeLabel} was approved by ${actorWithRole(req.user)}.`,
+          jobId: null,
+          recipientIds: [timeout.technician._id],
+          meta: {
+            timeoutRequestId: timeout._id.toString(),
+            timeoutStatus: TIMEOUT_REQUEST_STATUS.APPROVED,
+            reason: timeout.reason,
+          },
+        });
+
+        emitToUsers({
+          event: 'notification',
+          data: {
+            type: 'TECH_TIMEOUT_REQUESTED',
+            message: managerMessage,
+            meta: {
+              timeoutRequestId: timeout._id.toString(),
+              timeoutStatus: TIMEOUT_REQUEST_STATUS.APPROVED,
+              reason: timeout.reason,
+              technicianId: timeout.technician._id.toString(),
+              startDate: timeout.startDate,
+              endDate: timeout.endDate,
+              reviewedByName: req.user.name,
+              reviewedByRole: req.user.role,
+            },
+          },
+          recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+          excludeUserId: req.user._id,
+        });
+
+        emitToUsers({
+          event: 'notifications:updated',
+          data: { timeoutRequestId: timeout._id.toString(), timeoutStatus: TIMEOUT_REQUEST_STATUS.APPROVED },
+          recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        });
+
+        emitJobUpdate();
+        return res.json({
+          success: true,
+          data: timeout.toObject(),
+          message: 'Timeout request approved',
+        });
+      }
+
+      timeout.status = TIMEOUT_REQUEST_STATUS.REJECTED;
+      timeout.reviewedBy = req.user._id;
+      timeout.reviewedAt = new Date();
+      timeout.reviewMessage = reviewMessage;
+      await timeout.save();
+
+      const managerMessage = reviewMessage
+        ? `${timeout.technician.name}'s timeout request for ${rangeLabel} was rejected by ${actorWithRole(req.user)}. Response: ${reviewMessage}`
+        : `${timeout.technician.name}'s timeout request for ${rangeLabel} was rejected by ${actorWithRole(req.user)}.`;
+
+      await updateRequestNotifications({
+        timeoutId: timeout._id,
+        message: managerMessage,
+        timeoutStatus: TIMEOUT_REQUEST_STATUS.REJECTED,
+        reviewMessage,
+        actorUserId: req.user._id,
+        reviewedByUser: req.user,
+        reason: timeout.reason,
+        technicianId: timeout.technician._id,
+        startDate: timeout.startDate,
+        endDate: timeout.endDate,
+      });
+
+      const rejectionMessage = reviewMessage
+        ? `Your timeout request for ${rangeLabel} was rejected by ${actorWithRole(req.user)}. Response: ${reviewMessage}`
+        : `Your timeout request for ${rangeLabel} was rejected by ${actorWithRole(req.user)}.`;
+
+      await createNotification({
+        type: 'TECH_TIMEOUT_REJECTED',
+        message: rejectionMessage,
+        jobId: null,
+        recipientIds: [timeout.technician._id],
+        meta: {
+          timeoutRequestId: timeout._id.toString(),
+          timeoutStatus: TIMEOUT_REQUEST_STATUS.REJECTED,
+          reason: timeout.reason,
+          reviewMessage,
+        },
+      });
+
+      emitToUsers({
+        event: 'notification',
+        data: {
+          type: 'TECH_TIMEOUT_REQUESTED',
+          message: managerMessage,
+          meta: {
+            timeoutRequestId: timeout._id.toString(),
+            timeoutStatus: TIMEOUT_REQUEST_STATUS.REJECTED,
+            reason: timeout.reason,
+            reviewMessage,
+            technicianId: timeout.technician._id.toString(),
+            startDate: timeout.startDate,
+            endDate: timeout.endDate,
+            reviewedByName: req.user.name,
+            reviewedByRole: req.user.role,
+          },
+        },
         recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,
       });
 
-      const io = getIO();
-      if (io) io.emit('jobs:updated'); // Refresh availability everywhere
+      emitToUsers({
+        event: 'notifications:updated',
+        data: {
+          timeoutRequestId: timeout._id.toString(),
+          timeoutStatus: TIMEOUT_REQUEST_STATUS.REJECTED,
+        },
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+      });
 
-      res.status(201).json({ success: true, data: timeout });
+      res.json({
+        success: true,
+        data: timeout.toObject(),
+        message: 'Timeout request rejected',
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
     }
@@ -247,12 +665,95 @@ router.delete('/:id', async (req, res) => {
       }
     }
 
+    if (req.user.role === ROLES.TECHNICIAN && timeout.status === TIMEOUT_REQUEST_STATUS.PENDING) {
+      const rangeLabel = formatTimeoutRange(timeout.startDate, timeout.endDate);
+      const managerMessage = `${actorWithRole(req.user)} cancelled the timeout request for ${rangeLabel}.`;
+
+      await updateRequestNotifications({
+        timeoutId: timeout._id,
+        message: managerMessage,
+        timeoutStatus: 'CANCELLED',
+        reviewedByUser: req.user,
+        reason: timeout.reason,
+        technicianId: req.user._id,
+        startDate: timeout.startDate,
+        endDate: timeout.endDate,
+      });
+
+      emitToUsers({
+        event: 'notification',
+        data: {
+          type: 'TECH_TIMEOUT_REQUESTED',
+          message: managerMessage,
+          meta: {
+            timeoutRequestId: timeout._id.toString(),
+            timeoutStatus: 'CANCELLED',
+            technicianId: req.user._id.toString(),
+            startDate: timeout.startDate,
+            endDate: timeout.endDate,
+            reason: timeout.reason,
+            reviewedByName: req.user.name,
+            reviewedByRole: req.user.role,
+          },
+        },
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+      });
+
+      emitToUsers({
+        event: 'notifications:updated',
+        data: {
+          timeoutRequestId: timeout._id.toString(),
+          timeoutStatus: 'CANCELLED',
+        },
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+      });
+    }
+
+    const isApprovedTimeout =
+      !timeout.status || timeout.status === TIMEOUT_REQUEST_STATUS.APPROVED;
+    const isTechDeletingUpcomingApprovedTimeout =
+      req.user.role === ROLES.TECHNICIAN &&
+      isApprovedTimeout &&
+      normalizeDateOnly(timeout.endDate) >= toLocalDateOnly();
+
+    if (isTechDeletingUpcomingApprovedTimeout) {
+      const rangeLabel = formatTimeoutRange(timeout.startDate, timeout.endDate);
+      const isSingleDay = normalizeDateOnly(timeout.startDate) === normalizeDateOnly(timeout.endDate);
+      const managerMessage = isSingleDay
+        ? `${actorWithRole(req.user)} deleted the approved time off for ${rangeLabel}. ${req.user.name} is now available on that date.`
+        : `${actorWithRole(req.user)} deleted the approved time off for ${rangeLabel}. ${req.user.name} is now available for those dates.`;
+
+      await createNotification({
+        type: 'TECH_TIMEOUT_CANCELLED',
+        message: managerMessage,
+        jobId: null,
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        meta: {
+          timeoutRequestId: timeout._id.toString(),
+          timeoutStatus: 'CANCELLED',
+          technicianId: req.user._id.toString(),
+          startDate: timeout.startDate,
+          endDate: timeout.endDate,
+          availabilityRestored: true,
+        },
+      });
+    }
+
     await TechTimeout.findByIdAndDelete(req.params.id);
 
-    const io = getIO();
-    if (io) io.emit('jobs:updated');
+    if (!timeout.status || timeout.status === TIMEOUT_REQUEST_STATUS.APPROVED) {
+      emitJobUpdate();
+    }
 
-    res.json({ success: true, message: 'Timeout entry deleted' });
+    res.json({
+      success: true,
+      message:
+        req.user.role === ROLES.TECHNICIAN && timeout.status === TIMEOUT_REQUEST_STATUS.PENDING
+          ? 'Timeout request cancelled'
+          : req.user.role === ROLES.TECHNICIAN && timeout.status === TIMEOUT_REQUEST_STATUS.REJECTED
+            ? 'Rejected request deleted'
+          : 'Timeout entry deleted',
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }

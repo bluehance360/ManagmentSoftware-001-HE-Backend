@@ -10,11 +10,20 @@ const { sendPushToUsers } = require('./PushService');
  * @param {string} opts.type - notification type
  * @param {string} opts.message - human-readable message
  * @param {string} opts.jobId - related job id
+ * @param {Object} [opts.meta] - additional metadata for notification actions
  * @param {string[]} [opts.recipientIds] - explicit recipient user ids
  * @param {string[]} [opts.recipientRoles] - send to all users with these roles
  * @param {string} [opts.excludeUserId] - exclude this user (the actor)
  */
-async function createNotification({ type, message, jobId, recipientIds, recipientRoles, excludeUserId }) {
+async function createNotification({
+  type,
+  message,
+  jobId,
+  meta,
+  recipientIds,
+  recipientRoles,
+  excludeUserId,
+}) {
   try {
     let recipients = [];
 
@@ -45,6 +54,7 @@ async function createNotification({ type, message, jobId, recipientIds, recipien
       type,
       message,
       job: jobId,
+      meta,
     }));
 
     await Notification.insertMany(docs);
@@ -52,10 +62,18 @@ async function createNotification({ type, message, jobId, recipientIds, recipien
     // Emit real-time socket event to recipients
     emitToUsers({
       event: 'notification',
-      data: { type, message, jobId },
+      data: { type, message, jobId, meta },
       recipientIds: recipients,
       excludeUserId,
     });
+
+    const timeoutRouteTypes = new Set([
+      'TECH_TIMEOUT',
+      'TECH_TIMEOUT_REQUESTED',
+      'TECH_TIMEOUT_APPROVED',
+      'TECH_TIMEOUT_REJECTED',
+      'TECH_TIMEOUT_CANCELLED',
+    ]);
 
     // Send Web Push to offline users (fire-and-forget)
     sendPushToUsers(recipients, {
@@ -64,9 +82,16 @@ async function createNotification({ type, message, jobId, recipientIds, recipien
       icon: '/Hosanna-logo.webp',
       badge: '/Hosanna-logo.webp',
       data: {
-        url: jobId ? '/jobs' : type === 'TEAM_MEMBER_JOINED' ? '/team' : type === 'TECH_TIMEOUT' ? '/timeout' : '/dashboard',
+        url: jobId
+          ? '/jobs'
+          : type === 'TEAM_MEMBER_JOINED'
+            ? '/team'
+            : timeoutRouteTypes.has(type)
+              ? '/timeout'
+              : '/dashboard',
         jobId,
         type,
+        meta,
       },
     }).catch(() => {}); // non-blocking
   } catch (error) {

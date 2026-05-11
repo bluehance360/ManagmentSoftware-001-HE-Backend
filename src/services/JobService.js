@@ -14,7 +14,7 @@ const Job = require('../models/Job');
 const User = require('../models/User');
 const JobType = require('../models/JobType');
 const TechTimeout = require('../models/TechTimeout');
-const { ROLES, JOB_STATUS, STATUS_TRANSITIONS } = require('../config/constants');
+const { ROLES, JOB_STATUS, STATUS_TRANSITIONS, TIMEOUT_REQUEST_STATUS } = require('../config/constants');
 const { normalizeDateOnly, toLocalDateOnly } = require('../utils/dateOnly');
 
 /**
@@ -81,6 +81,10 @@ async function checkTechAvailability(technicianId, scheduledDate, excludeJobId =
 
   const timeout = await TechTimeout.findOne({
     technician: technicianId,
+    $or: [
+      { status: TIMEOUT_REQUEST_STATUS.APPROVED },
+      { status: { $exists: false } },
+    ],
     startDate: { $lte: targetDay },
     endDate: { $gte: targetDay },
   }).lean();

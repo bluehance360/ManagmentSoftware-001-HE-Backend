@@ -6,6 +6,14 @@ const { authenticate } = require('../middleware/auth');
 const router = express.Router();
 router.use(authenticate);
 
+function protectedPendingRequestFilter(userId) {
+  return {
+    recipient: userId,
+    type: 'TECH_TIMEOUT_REQUESTED',
+    'meta.timeoutStatus': 'PENDING',
+  };
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Push subscription endpoints (must come before /:id param routes)
 // ══════════════════════════════════════════════════════════════════════
@@ -128,8 +136,31 @@ router.patch('/read-all', async (req, res) => {
 // ── DELETE /api/notifications/all ───────────────────────────────────
 router.delete('/all', async (req, res) => {
   try {
-    const result = await Notification.deleteMany({ recipient: req.user._id });
-    res.json({ success: true, message: `Deleted ${result.deletedCount} notifications` });
+    const [result, preservedCount] = await Promise.all([
+      Notification.deleteMany({
+        recipient: req.user._id,
+        $nor: [
+          {
+            type: 'TECH_TIMEOUT_REQUESTED',
+            'meta.timeoutStatus': 'PENDING',
+          },
+        ],
+      }),
+      Notification.countDocuments(protectedPendingRequestFilter(req.user._id)),
+    ]);
+
+    const message = preservedCount > 0
+      ? `Deleted ${result.deletedCount} notifications. ${preservedCount} pending timeout request notification${preservedCount === 1 ? '' : 's'} ${preservedCount === 1 ? 'was' : 'were'} kept because action is still required.`
+      : `Deleted ${result.deletedCount} notifications`;
+
+    res.json({
+      success: true,
+      message,
+      data: {
+        deletedCount: result.deletedCount,
+        preservedCount,
+      },
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -138,6 +169,18 @@ router.delete('/all', async (req, res) => {
 // ── DELETE /api/notifications/:id ───────────────────────────────────
 router.delete('/:id', async (req, res) => {
   try {
+    const protectedNotification = await Notification.findOne({
+      _id: req.params.id,
+      ...protectedPendingRequestFilter(req.user._id),
+    }).lean();
+
+    if (protectedNotification) {
+      return res.status(400).json({
+        success: false,
+        error: 'Pending timeout request notifications cannot be deleted while action is still required',
+      });
+    }
+
     const notification = await Notification.findOneAndDelete({
       _id: req.params.id,
       recipient: req.user._id,

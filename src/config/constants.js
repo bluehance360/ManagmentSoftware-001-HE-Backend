@@ -9,6 +9,12 @@ const ROLES = {
   TECHNICIAN: 'TECHNICIAN',
 };
 
+const TIMEOUT_REQUEST_STATUS = {
+  PENDING: 'PENDING',
+  APPROVED: 'APPROVED',
+  REJECTED: 'REJECTED',
+};
+
 // Job statuses
 const JOB_STATUS = {
   TENTATIVE:   'TENTATIVE',
@@ -57,4 +63,5 @@ module.exports = {
   ROLES,
   JOB_STATUS,
   STATUS_TRANSITIONS,
+  TIMEOUT_REQUEST_STATUS,
 };
