@@ -29,7 +29,8 @@ async function findJobTypeByName(jobTypeName) {
 }
 
 /**
- * If the job's type requires certification, ensure each technician id is certified.
+ * If the job's type requires certification, ensure each listed technician id is certified.
+ * Used for primary assignment only; secondary does not require certification for the job type.
  * Returns an error string if any technician is missing the cert, otherwise null.
  */
 async function ensureTechCertifiedForJobType(jobTypeName, technicianIds) {
@@ -305,11 +306,8 @@ async function assignTechnician(
     }
   }
 
-  // 2d) If the job type requires certification, both techs must be certified.
-  const certError = await ensureTechCertifiedForJobType(
-    jobForSchedule.jobType,
-    [technicianId, secondaryTechnicianId].filter(Boolean)
-  );
+  // 2d) If the job type requires certification, only the primary must be certified.
+  const certError = await ensureTechCertifiedForJobType(jobForSchedule.jobType, [technicianId]);
   if (certError) return { error: certError, status: 400 };
 
   // 3) Atomic: only matches if status is still CONFIRMED

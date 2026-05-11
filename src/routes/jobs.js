@@ -313,8 +313,8 @@ router.delete(
 router.get('/:id', async (req, res) => {
   try {
     const job = await Job.findById(req.params.id)
-      .populate('assignedTechnician', 'name email')
-      .populate('secondaryAssignedTechnician', 'name email')
+      .populate('assignedTechnician', 'name email certificates')
+      .populate('secondaryAssignedTechnician', 'name email certificates')
       .populate('createdBy', 'name email')
       .populate('customer', 'name phone email address')
       .populate('statusHistory.changedBy', 'name email role')
@@ -818,8 +818,8 @@ router.patch(
 
     try {
       const job = await Job.findById(req.params.id)
-        .populate('assignedTechnician', 'name email')
-        .populate('secondaryAssignedTechnician', 'name email');
+        .populate('assignedTechnician', 'name email certificates')
+        .populate('secondaryAssignedTechnician', 'name email certificates');
 
       if (!job) {
         return res.status(404).json({ success: false, error: 'Job not found' });
@@ -893,10 +893,10 @@ router.patch(
         newSecondaryTechName = newSecondaryTech.name;
       }
 
-      // Enforce certification requirement for cert-required job types
+      // Enforce certification for cert-required job types on primary only
       const reassignCertError = await JobService.ensureTechCertifiedForJobType(
         job.jobType,
-        [req.body.technicianId, nextSecondaryTechId].filter(Boolean)
+        [req.body.technicianId]
       );
       if (reassignCertError) {
         return res.status(400).json({ success: false, error: reassignCertError });
@@ -915,8 +915,8 @@ router.patch(
       await job.save();
 
       // Re-populate for response
-      await job.populate('assignedTechnician', 'name email');
-      await job.populate('secondaryAssignedTechnician', 'name email');
+      await job.populate('assignedTechnician', 'name email certificates');
+      await job.populate('secondaryAssignedTechnician', 'name email certificates');
       await job.populate('createdBy', 'name email');
 
       // Reassign notifications: notify only affected technicians.
@@ -1037,8 +1037,8 @@ router.patch(
         }
       }
       await job.save();
-      await job.populate('assignedTechnician', 'name email');
-      await job.populate('secondaryAssignedTechnician', 'name email');
+      await job.populate('assignedTechnician', 'name email certificates');
+      await job.populate('secondaryAssignedTechnician', 'name email certificates');
       await job.populate('createdBy', 'name email');
 
       broadcastJobUpdate();
