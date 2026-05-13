@@ -81,6 +81,24 @@ const documentSchema = new mongoose.Schema(
   { _id: true }
 );
 
+const assignmentDocumentRequirementSchema = new mongoose.Schema(
+  {
+    key: { type: String, required: true, trim: true },
+    label: { type: String, required: true, trim: true },
+    checked: { type: Boolean, default: false },
+    textValue: { type: String, trim: true, default: '' },
+    document: {
+      key: { type: String, trim: true },
+      fileName: { type: String, trim: true },
+      contentType: { type: String, trim: true, default: 'application/octet-stream' },
+      size: { type: Number, min: 0, default: 0 },
+      uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+      uploadedAt: { type: Date },
+    },
+  },
+  { _id: false }
+);
+
 const jobSchema = new mongoose.Schema(
   {
     title: {
@@ -159,6 +177,10 @@ const jobSchema = new mongoose.Schema(
       firstPageReceived: { type: Boolean, default: false },
       printsDrawingsReceived: { type: Boolean, default: false },
       siteContactInfoReceived: { type: Boolean, default: false },
+    },
+    assignmentDocumentRequirements: {
+      type: [assignmentDocumentRequirementSchema],
+      default: [],
     },
     actualCost: {
       type: Number,

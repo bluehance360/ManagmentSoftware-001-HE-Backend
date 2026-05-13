@@ -15,12 +15,41 @@ const jobTypeSchema = new mongoose.Schema(
       lowercase: true,
       unique: true,
     },
-    // Locked at creation time. Once persisted it cannot be changed; the only way
-    // to alter the cert requirement for a type is to delete and recreate it.
     certificationRequired: {
       type: Boolean,
       default: false,
-      immutable: true,
+    },
+    /** When true, jobs of this type require programmingSubtype (New / Existing Start-Up). */
+    isProgramming: {
+      type: Boolean,
+      default: false,
+    },
+    /** Labels shown in assign flow; future enforcement will use these keys/labels. */
+    documentRequirements: {
+      type: [
+        {
+          label: { type: String, required: true, trim: true, maxlength: 200 },
+        },
+      ],
+      default: [],
+    },
+    programmingDocumentRequirements: {
+      newStartup: {
+        type: [
+          {
+            label: { type: String, required: true, trim: true, maxlength: 200 },
+          },
+        ],
+        default: [],
+      },
+      existingStartup: {
+        type: [
+          {
+            label: { type: String, required: true, trim: true, maxlength: 200 },
+          },
+        ],
+        default: [],
+      },
     },
   },
   { timestamps: false }

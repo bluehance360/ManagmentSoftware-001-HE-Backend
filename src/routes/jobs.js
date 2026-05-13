@@ -2,6 +2,7 @@ const express = require('express');
 const { body, param, validationResult } = require('express-validator');
 const Job = require('../models/Job');
 const JobType = require('../models/JobType');
+const JobTypeSettings = require('../models/JobTypeSettings');
 const User = require('../models/User');
 const { authenticate, authorize } = require('../middleware/auth');
 const { ROLES, JOB_STATUS } = require('../config/constants');
@@ -35,15 +36,11 @@ const TECH_VISIBLE_STATUSES = [
   JOB_STATUS.CLOSED,
 ];
 
-const PROGRAMMING_JOB_TYPES = new Set([
-  'leviton',
-  'crestron',
-  'lutron',
-  'nlight',
-  'wattstopper',
-]);
-
 const PROGRAMMING_SUBTYPES = ['New Start-Up', 'Existing Start-Up'];
+const EMPTY_PROGRAMMING_REQUIREMENT_DEFAULTS = {
+  newStartup: [],
+  existingStartup: [],
+};
 
 function normalizeJobType(value) {
   return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
@@ -53,23 +50,140 @@ function normalizeProgrammingSubtype(value) {
   return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
 }
 
-function isProgrammingJobType(value) {
-  const normalized = normalizeJobType(value).toLowerCase();
-  return PROGRAMMING_JOB_TYPES.has(normalized);
+function sanitizeDocumentRequirements(input) {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((item) => {
+      const label =
+        typeof item === 'string'
+          ? item.trim()
+          : typeof item?.label === 'string'
+            ? item.label.trim()
+            : '';
+      return label ? { label } : null;
+    })
+    .filter(Boolean)
+    .slice(0, 30);
 }
 
-async function ensureJobTypeSaved(name, { certificationRequired } = {}) {
+function toRequirementKey(label, fallbackIndex = 0) {
+  const normalized = String(label || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized || `requirement-${fallbackIndex + 1}`;
+}
+
+function sanitizeProgrammingRequirements(input) {
+  const source = input && typeof input === 'object' ? input : {};
+  return {
+    newStartup: sanitizeDocumentRequirements(source.newStartup),
+    existingStartup: sanitizeDocumentRequirements(source.existingStartup),
+  };
+}
+
+async function getProgrammingRequirementDefaults() {
+  const settings = await JobTypeSettings.findOne({ key: 'global' })
+    .select('programmingDocumentRequirements')
+    .lean();
+  return sanitizeProgrammingRequirements(
+    settings?.programmingDocumentRequirements || EMPTY_PROGRAMMING_REQUIREMENT_DEFAULTS
+  );
+}
+
+function resolveJobTypeDocumentRequirements(type, programmingSubtype, programmingDefaults) {
+  if (!type) return [];
+  const generalRows = sanitizeDocumentRequirements(type.documentRequirements);
+  if (!type.isProgramming) {
+    return generalRows;
+  }
+
+  const isExisting = normalizeProgrammingSubtype(programmingSubtype) === 'Existing Start-Up';
+  const override = sanitizeProgrammingRequirements(type.programmingDocumentRequirements);
+  const overrideRows = isExisting ? override.existingStartup : override.newStartup;
+  const defaultRows = isExisting
+    ? programmingDefaults.existingStartup
+    : programmingDefaults.newStartup;
+  const subtypeRows = overrideRows.length ? overrideRows : defaultRows;
+  return [...generalRows, ...subtypeRows];
+}
+
+function buildAssignmentRequirementRows(requirements, previousRows = []) {
+  const previousByKey = new Map(
+    (Array.isArray(previousRows) ? previousRows : [])
+      .filter((row) => row && row.key && row.label)
+      .map((row) => [String(row.key), row])
+  );
+
+  return sanitizeDocumentRequirements(requirements).map((row, index) => {
+    const key = toRequirementKey(row.label, index);
+    const previous = previousByKey.get(key);
+    return {
+      key,
+      label: row.label,
+      checked: Boolean(previous?.checked),
+      textValue: String(previous?.textValue || '').trim(),
+      document: previous?.document?.key
+        ? {
+            key: previous.document.key,
+            fileName: previous.document.fileName || '',
+            contentType: previous.document.contentType || 'application/octet-stream',
+            size: Number(previous.document.size || 0),
+            uploadedBy: previous.document.uploadedBy || null,
+            uploadedAt: previous.document.uploadedAt || null,
+          }
+        : null,
+    };
+  });
+}
+
+async function resolveAssignmentRequirementsForJob(jobDoc) {
+  const normalizedJobType = normalizeJobType(jobDoc?.jobType).toLowerCase();
+  if (!normalizedJobType) return [];
+  const type = await JobType.findOne({ normalizedName: normalizedJobType }).lean();
+  if (!type) return [];
+  const defaults = await getProgrammingRequirementDefaults();
+  const resolved = resolveJobTypeDocumentRequirements(type, jobDoc?.programmingSubtype, defaults);
+  return buildAssignmentRequirementRows(resolved, jobDoc?.assignmentDocumentRequirements || []);
+}
+
+/** Resolve whether the named job type is a programming type (from DB). */
+async function jobTypeIsProgramming(jobTypeName) {
+  const normalized = normalizeJobType(jobTypeName).toLowerCase();
+  if (!normalized) return false;
+  const doc = await JobType.findOne({ normalizedName: normalized }).select('isProgramming').lean();
+  return Boolean(doc?.isProgramming);
+}
+
+async function ensureJobTypeSaved(name, opts = {}) {
   const normalizedName = normalizeJobType(name);
   if (!normalizedName) return null;
 
-  // certificationRequired is immutable post-create. If a record already exists
-  // we keep its existing flag; only $setOnInsert applies on first creation.
+  const {
+    certificationRequired,
+    isProgramming,
+    documentRequirements,
+    programmingDocumentRequirements,
+  } = opts;
+
   const setOnInsert = {
     name: normalizedName,
     normalizedName: normalizedName.toLowerCase(),
   };
   if (typeof certificationRequired === 'boolean') {
     setOnInsert.certificationRequired = certificationRequired;
+  }
+  if (typeof isProgramming === 'boolean') {
+    setOnInsert.isProgramming = isProgramming;
+  }
+  if (documentRequirements !== undefined) {
+    setOnInsert.documentRequirements = sanitizeDocumentRequirements(documentRequirements);
+  }
+  if (programmingDocumentRequirements !== undefined) {
+    setOnInsert.programmingDocumentRequirements = sanitizeProgrammingRequirements(
+      programmingDocumentRequirements
+    );
   }
 
   return JobType.findOneAndUpdate(
@@ -108,6 +222,9 @@ async function listJobTypesWithUsage() {
     _id: type._id,
     name: type.name,
     certificationRequired: Boolean(type.certificationRequired),
+    isProgramming: Boolean(type.isProgramming),
+    documentRequirements: Array.isArray(type.documentRequirements) ? type.documentRequirements : [],
+    programmingDocumentRequirements: sanitizeProgrammingRequirements(type.programmingDocumentRequirements),
     usageCount: usageMap.get(type.normalizedName)?.usageCount || 0,
     jobTitles: usageMap.get(type.normalizedName)?.jobTitles || [],
   }));
@@ -147,6 +264,77 @@ function formatRoleLabel(role) {
 
 function actorWithRole(user) {
   return `${user.name} (${formatRoleLabel(user.role)})`;
+}
+
+function notifyAssignmentDocumentChange({ job, documentFieldName, action, actorUser }) {
+  if (!job || !documentFieldName || !action || !actorUser) return;
+  const recipientIds = [];
+  if (job.assignedTechnician) recipientIds.push(job.assignedTechnician);
+  if (job.secondaryAssignedTechnician) recipientIds.push(job.secondaryAssignedTechnician);
+
+  createNotification({
+    type: 'JOB_DOCUMENTS_UPDATED',
+    message: `Job "${job.title || 'Untitled'}": ${documentFieldName} is ${action} by ${actorWithRole(actorUser)}.`,
+    jobId: job._id,
+    recipientIds,
+    recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+    excludeUserId: actorUser._id,
+  });
+}
+
+function notifyAssignmentChecklistUpdated({ job, summaryLines, actorUser }) {
+  if (!job || !actorUser) return;
+  const recipientIds = [];
+  if (job.assignedTechnician) recipientIds.push(job.assignedTechnician);
+  if (job.secondaryAssignedTechnician) recipientIds.push(job.secondaryAssignedTechnician);
+  const detail = summaryLines?.length ? summaryLines.join('; ') : 'checklist updated';
+  createNotification({
+    type: 'JOB_UPDATED',
+    message: `Job "${job.title || 'Untitled'}": Assignment checklist updated (${detail}) by ${actorWithRole(actorUser)}.`,
+    jobId: job._id,
+    recipientIds,
+    recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+    excludeUserId: actorUser._id,
+  });
+}
+
+/** Compare saved rows to merged rows; notify when requirement text (textValue) changed. */
+function collectAssignmentRequirementTextNoteChanges(beforeRows, afterRows) {
+  const beforeByKey = new Map(
+    (Array.isArray(beforeRows) ? beforeRows : [])
+      .filter((row) => row && row.key)
+      .map((row) => [String(row.key), String(row.textValue || '').trim()])
+  );
+  const entries = [];
+  for (const row of Array.isArray(afterRows) ? afterRows : []) {
+    if (!row?.key) continue;
+    const key = String(row.key);
+    const prevText = beforeByKey.has(key) ? beforeByKey.get(key) : '';
+    const nextText = String(row.textValue || '').trim();
+    if (prevText === nextText) continue;
+    const label = String(row.label || key).trim() || key;
+    let summary = 'text note updated';
+    if (!prevText && nextText) summary = 'text note added';
+    else if (prevText && !nextText) summary = 'text note removed';
+    entries.push({ label, summary });
+  }
+  return entries;
+}
+
+function notifyAssignmentRequirementNoteChanges({ job, entries, actorUser }) {
+  if (!job || !actorUser || !entries?.length) return;
+  const recipientIds = [];
+  if (job.assignedTechnician) recipientIds.push(job.assignedTechnician);
+  if (job.secondaryAssignedTechnician) recipientIds.push(job.secondaryAssignedTechnician);
+  const detail = entries.map((e) => `"${e.label}" — ${e.summary}`).join('; ');
+  createNotification({
+    type: 'JOB_DOCUMENTS_UPDATED',
+    message: `Job "${job.title || 'Untitled'}": ${detail} by ${actorWithRole(actorUser)}.`,
+    jobId: job._id,
+    recipientIds,
+    recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+    excludeUserId: actorUser._id,
+  });
 }
 
 router.use(authenticate);
@@ -206,7 +394,7 @@ router.get('/', async (req, res) => {
         .populate('assignedTechnician', 'name email')
         .populate('secondaryAssignedTechnician', 'name email')
         .populate('createdBy', 'name email')
-        .populate('customer', 'name phone email address')
+        .populate('customer', 'name phone email address firstPageRequired')
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parseInt(limit)),
@@ -231,12 +419,42 @@ router.get('/', async (req, res) => {
 // ── GET /api/jobs/job-types ─────────────────────────────────────────
 router.get('/job-types', async (req, res) => {
   try {
-    const jobTypes = await listJobTypesWithUsage();
-    res.json({ success: true, data: jobTypes });
+    const [jobTypes, programmingRequirementDefaults] = await Promise.all([
+      listJobTypesWithUsage(),
+      getProgrammingRequirementDefaults(),
+    ]);
+    res.json({ success: true, data: jobTypes, programmingRequirementDefaults });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+router.patch(
+  '/job-types/programming-defaults',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  [
+    body('newStartup').optional().isArray().withMessage('newStartup must be an array'),
+    body('existingStartup').optional().isArray().withMessage('existingStartup must be an array'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+    try {
+      const programmingDocumentRequirements = sanitizeProgrammingRequirements(req.body);
+      await JobTypeSettings.findOneAndUpdate(
+        { key: 'global' },
+        { $set: { key: 'global', programmingDocumentRequirements } },
+        { upsert: true, new: true }
+      );
+      const jobTypes = await listJobTypesWithUsage();
+      return res.json({ success: true, data: { jobTypes, programmingRequirementDefaults: programmingDocumentRequirements } });
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
 
 // ── POST /api/jobs/job-types (ADMIN, OFFICE_MANAGER) ───────────────
 router.post(
@@ -245,6 +463,11 @@ router.post(
   [
     body('name').notEmpty().withMessage('Job type name is required').isString().withMessage('Job type name must be a string'),
     body('certificationRequired').optional().isBoolean().withMessage('certificationRequired must be true or false'),
+    body('isProgramming').optional().isBoolean().withMessage('isProgramming must be true or false'),
+    body('documentRequirements').optional().isArray().withMessage('documentRequirements must be an array'),
+    body('programmingDocumentRequirements').optional().isObject().withMessage('programmingDocumentRequirements must be an object'),
+    body('programmingDocumentRequirements.newStartup').optional().isArray().withMessage('newStartup must be an array'),
+    body('programmingDocumentRequirements.existingStartup').optional().isArray().withMessage('existingStartup must be an array'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -258,13 +481,83 @@ router.post(
         return res.status(400).json({ success: false, error: 'Job type name is required' });
       }
 
+      const defaults = await getProgrammingRequirementDefaults();
+      const isProgramming = Boolean(req.body.isProgramming);
       await ensureJobTypeSaved(normalizedName, {
         certificationRequired: Boolean(req.body.certificationRequired),
+        isProgramming,
+        documentRequirements: sanitizeDocumentRequirements(req.body.documentRequirements),
+        programmingDocumentRequirements: isProgramming
+          ? sanitizeProgrammingRequirements(
+              req.body.programmingDocumentRequirements || defaults
+            )
+          : sanitizeProgrammingRequirements(req.body.programmingDocumentRequirements),
       });
       const jobTypes = await listJobTypesWithUsage();
       const created = jobTypes.find((item) => item.name.toLowerCase() === normalizedName.toLowerCase());
 
       res.status(201).json({ success: true, data: { jobType: created, jobTypes } });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── PATCH /api/jobs/job-types/:id (ADMIN, OFFICE_MANAGER) ───────────
+router.patch(
+  '/job-types/:id',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  [
+    param('id').isMongoId().withMessage('Invalid job type ID'),
+    body('certificationRequired').optional().isBoolean().withMessage('certificationRequired must be true or false'),
+    body('isProgramming').optional().isBoolean().withMessage('isProgramming must be true or false'),
+    body('documentRequirements').optional().isArray().withMessage('documentRequirements must be an array'),
+    body('programmingDocumentRequirements').optional().isObject().withMessage('programmingDocumentRequirements must be an object'),
+    body('programmingDocumentRequirements.newStartup').optional().isArray().withMessage('newStartup must be an array'),
+    body('programmingDocumentRequirements.existingStartup').optional().isArray().withMessage('existingStartup must be an array'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const type = await JobType.findById(req.params.id);
+      if (!type) {
+        return res.status(404).json({ success: false, error: 'Job type not found' });
+      }
+
+      const $set = {};
+      if (req.body.certificationRequired !== undefined) {
+        $set.certificationRequired = Boolean(req.body.certificationRequired);
+      }
+      if (req.body.isProgramming !== undefined) {
+        $set.isProgramming = Boolean(req.body.isProgramming);
+      }
+      if (req.body.documentRequirements !== undefined) {
+        $set.documentRequirements = sanitizeDocumentRequirements(req.body.documentRequirements);
+      }
+      if (req.body.programmingDocumentRequirements !== undefined) {
+        $set.programmingDocumentRequirements = sanitizeProgrammingRequirements(
+          req.body.programmingDocumentRequirements
+        );
+      } else if (req.body.isProgramming === true && !type.isProgramming) {
+        $set.programmingDocumentRequirements = await getProgrammingRequirementDefaults();
+      }
+
+      if (Object.keys($set).length === 0) {
+        const jobTypes = await listJobTypesWithUsage();
+        const unchanged = jobTypes.find((t) => t._id.toString() === req.params.id);
+        return res.json({ success: true, data: { jobType: unchanged, jobTypes } });
+      }
+
+      await JobType.findByIdAndUpdate(req.params.id, { $set });
+      const jobTypes = await listJobTypesWithUsage();
+      const updated = jobTypes.find((t) => t._id.toString() === req.params.id);
+
+      broadcastJobUpdate();
+      res.json({ success: true, data: { jobType: updated, jobTypes } });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
     }
@@ -316,7 +609,7 @@ router.get('/:id', async (req, res) => {
       .populate('assignedTechnician', 'name email certificates')
       .populate('secondaryAssignedTechnician', 'name email certificates')
       .populate('createdBy', 'name email')
-      .populate('customer', 'name phone email address')
+      .populate('customer', 'name phone email address firstPageRequired')
       .populate('statusHistory.changedBy', 'name email role')
       .populate('statusHistory.technician', 'name email')
       .populate('documents.uploadedBy', 'name email role');
@@ -346,6 +639,11 @@ router.get('/:id', async (req, res) => {
       if (primaryTechId !== req.user._id.toString() && secondaryTechId !== req.user._id.toString()) {
         return res.status(403).json({ success: false, error: 'Not authorized to view this job' });
       }
+    }
+
+    const resolvedRequirements = await resolveAssignmentRequirementsForJob(job);
+    if (resolvedRequirements.length > 0) {
+      job.assignmentDocumentRequirements = resolvedRequirements;
     }
 
     res.json({ success: true, data: job });
@@ -385,7 +683,7 @@ router.post(
         return res.status(400).json({ success: false, error: 'Job type is required' });
       }
       req.body.programmingSubtype = normalizeProgrammingSubtype(req.body.programmingSubtype);
-      if (isProgrammingJobType(req.body.jobType)) {
+      if (await jobTypeIsProgramming(req.body.jobType)) {
         if (!req.body.programmingSubtype) {
           return res.status(400).json({
             success: false,
@@ -745,6 +1043,7 @@ router.patch(
     body('assignmentChecklist.firstPageReceived').optional().isBoolean().withMessage('firstPageReceived must be true or false'),
     body('assignmentChecklist.printsDrawingsReceived').optional().isBoolean().withMessage('printsDrawingsReceived must be true or false'),
     body('assignmentChecklist.siteContactInfoReceived').optional().isBoolean().withMessage('siteContactInfoReceived must be true or false'),
+    body('assignmentDocumentRequirements').optional().isArray().withMessage('assignmentDocumentRequirements must be an array'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -759,7 +1058,8 @@ router.patch(
         req.user,
         req.body.notes,
         req.body.assignmentChecklist,
-        req.body.secondaryTechnicianId || null
+        req.body.secondaryTechnicianId || null,
+        req.body.assignmentDocumentRequirements || []
       );
 
       if (result.error) {
@@ -797,6 +1097,308 @@ router.patch(
       res.json({ success: true, data: result.data, message: 'Technician assigned' });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── PATCH /api/jobs/:id/assignment-document-requirements ────────────
+router.patch(
+  '/:id/assignment-document-requirements',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  [body('requirements').isArray().withMessage('requirements must be an array')],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+    try {
+      const job = await Job.findById(req.params.id);
+      if (!job) {
+        return res.status(404).json({ success: false, error: 'Job not found' });
+      }
+      if (!canAccessJob(req.user, job)) {
+        return res.status(403).json({ success: false, error: 'Not authorized to update this job' });
+      }
+
+      const previousRows = Array.isArray(job.assignmentDocumentRequirements)
+        ? job.assignmentDocumentRequirements.map((row) =>
+            row?.toObject ? row.toObject() : { ...row }
+          )
+        : [];
+
+      const merged = buildAssignmentRequirementRows(
+        req.body.requirements.map((row) => ({ label: row?.label || '' })),
+        req.body.requirements.map((row, idx) => ({
+          key: row?.key || toRequirementKey(row?.label || '', idx),
+          label: String(row?.label || '').trim(),
+          checked: Boolean(row?.checked),
+          textValue: String(row?.textValue || '').trim(),
+          document: row?.document?.key
+            ? {
+                key: row.document.key,
+                fileName: row.document.fileName || '',
+                contentType: row.document.contentType || 'application/octet-stream',
+                size: Number(row.document.size || 0),
+                uploadedBy: row.document.uploadedBy || null,
+                uploadedAt: row.document.uploadedAt || null,
+              }
+            : null,
+        }))
+      );
+
+      const textNoteChanges = collectAssignmentRequirementTextNoteChanges(previousRows, merged);
+
+      job.assignmentDocumentRequirements = merged;
+      if (textNoteChanges.length) {
+        const historyLine = textNoteChanges
+          .map((e) => `"${e.label}" (${e.summary})`)
+          .join('; ');
+        job.statusHistory.push({
+          fromStatus: job.status,
+          toStatus: job.status,
+          changedBy: req.user._id,
+          changedAt: new Date(),
+          notes: `Requirement notes updated by ${actorWithRole(req.user)}: ${historyLine}.`,
+        });
+        notifyAssignmentRequirementNoteChanges({
+          job,
+          entries: textNoteChanges,
+          actorUser: req.user,
+        });
+      }
+      await job.save();
+      await job.populate('documents.uploadedBy', 'name email role');
+      broadcastJobUpdate();
+      return res.json({ success: true, data: job, message: 'Assignment document requirements updated' });
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── POST /api/jobs/:id/assignment-documents/presign ─────────────────
+router.post(
+  '/:id/assignment-documents/presign',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  [
+    body('requirementKey').isString().withMessage('requirementKey is required'),
+    body('fileName').isString().withMessage('fileName is required'),
+    body('contentType').optional().isString(),
+    body('size').optional().isInt({ min: 0 }),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+    try {
+      const job = await Job.findById(req.params.id).select('_id assignmentDocumentRequirements');
+      if (!job) {
+        return res.status(404).json({ success: false, error: 'Job not found' });
+      }
+      if (!canAccessJob(req.user, job)) {
+        return res.status(403).json({ success: false, error: 'Not authorized to update this job' });
+      }
+
+      const requirement = (job.assignmentDocumentRequirements || []).find(
+        (row) => row?.key === req.body.requirementKey
+      );
+      if (!requirement) {
+        return res.status(400).json({ success: false, error: 'Invalid requirement key' });
+      }
+
+      const key = buildDocumentKey(job._id.toString(), req.body.fileName);
+      const presignedUrl = await getUploadUrl({
+        key,
+        contentType: req.body.contentType || 'application/octet-stream',
+        expiresIn: 300,
+      });
+
+      return res.json({
+        success: true,
+        data: {
+          requirementKey: req.body.requirementKey,
+          key,
+          fileName: req.body.fileName,
+          contentType: req.body.contentType || 'application/octet-stream',
+          size: Number(req.body.size || 0),
+          presignedUrl,
+          expiresIn: 300,
+        },
+      });
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── POST /api/jobs/:id/assignment-documents/complete ────────────────
+router.post(
+  '/:id/assignment-documents/complete',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  [
+    body('requirementKey').isString().withMessage('requirementKey is required'),
+    body('key').isString().withMessage('key is required'),
+    body('fileName').isString().withMessage('fileName is required'),
+    body('contentType').optional().isString(),
+    body('size').optional().isInt({ min: 0 }),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+    try {
+      const head = await headObject(req.body.key);
+      if (!head) {
+        return res.status(400).json({ success: false, error: 'Uploaded file not found in storage' });
+      }
+
+      const job = await Job.findById(req.params.id);
+      if (!job) {
+        return res.status(404).json({ success: false, error: 'Job not found' });
+      }
+      if (!canAccessJob(req.user, job)) {
+        return res.status(403).json({ success: false, error: 'Not authorized to update this job' });
+      }
+
+      const rows = Array.isArray(job.assignmentDocumentRequirements)
+        ? [...job.assignmentDocumentRequirements]
+        : [];
+      const rowIndex = rows.findIndex((row) => row?.key === req.body.requirementKey);
+      if (rowIndex === -1) {
+        return res.status(400).json({ success: false, error: 'Invalid requirement key' });
+      }
+
+      const currentRow = rows[rowIndex]?.toObject ? rows[rowIndex].toObject() : rows[rowIndex];
+      const previousKey = currentRow?.document?.key;
+      rows[rowIndex] = {
+        ...currentRow,
+        checked: true,
+        document: {
+          key: req.body.key,
+          fileName: req.body.fileName,
+          contentType: req.body.contentType || head.ContentType || 'application/octet-stream',
+          size: Number(req.body.size || head.ContentLength || 0),
+          uploadedBy: req.user._id,
+          uploadedAt: new Date(),
+        },
+      };
+      job.assignmentDocumentRequirements = rows;
+      const changedFieldName = currentRow?.label || req.body.fileName || 'Document';
+      job.statusHistory.push({
+        fromStatus: job.status,
+        toStatus: job.status,
+        changedBy: req.user._id,
+        changedAt: new Date(),
+        notes: `${changedFieldName} is ${previousKey ? 'updated' : 'uploaded'} by ${actorWithRole(req.user)}.`,
+      });
+      await job.save();
+
+      if (previousKey && previousKey !== req.body.key) {
+        await deleteObject(previousKey).catch(() => {});
+      }
+      notifyAssignmentDocumentChange({
+        job,
+        documentFieldName: changedFieldName,
+        action: previousKey ? 'updated' : 'uploaded',
+        actorUser: req.user,
+      });
+      broadcastJobUpdate();
+
+      return res.json({
+        success: true,
+        data: {
+          assignmentDocumentRequirements: job.assignmentDocumentRequirements,
+        },
+      });
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── GET /api/jobs/:id/assignment-documents/:requirementKey/url ──────
+router.get(
+  '/:id/assignment-documents/:requirementKey/url',
+  async (req, res) => {
+    try {
+      const job = await Job.findById(req.params.id).select(
+        '_id status assignedTechnician secondaryAssignedTechnician assignmentDocumentRequirements'
+      );
+      if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (!canAccessJob(req.user, job)) {
+        return res.status(403).json({ success: false, error: 'Not authorized to view this job' });
+      }
+      const row = (job.assignmentDocumentRequirements || []).find(
+        (item) => item?.key === req.params.requirementKey
+      );
+      if (!row?.document?.key) {
+        return res.status(404).json({ success: false, error: 'Document not found' });
+      }
+      const url = await getDownloadUrl({
+        key: row.document.key,
+        fileName: row.document.fileName || 'document',
+        expiresIn: 900,
+      });
+      return res.json({ success: true, data: { url } });
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── DELETE /api/jobs/:id/assignment-documents/:requirementKey ───────
+router.delete(
+  '/:id/assignment-documents/:requirementKey',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  async (req, res) => {
+    try {
+      const job = await Job.findById(req.params.id);
+      if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (!canAccessJob(req.user, job)) {
+        return res.status(403).json({ success: false, error: 'Not authorized to update this job' });
+      }
+      const rows = Array.isArray(job.assignmentDocumentRequirements)
+        ? [...job.assignmentDocumentRequirements]
+        : [];
+      const rowIndex = rows.findIndex((row) => row?.key === req.params.requirementKey);
+      if (rowIndex === -1) {
+        return res.status(404).json({ success: false, error: 'Requirement not found' });
+      }
+      const currentRow = rows[rowIndex]?.toObject ? rows[rowIndex].toObject() : rows[rowIndex];
+      const oldKey = currentRow?.document?.key;
+      const changedFieldName = currentRow?.label || 'Document';
+      rows[rowIndex] = {
+        ...currentRow,
+        document: null,
+      };
+      job.assignmentDocumentRequirements = rows;
+      job.statusHistory.push({
+        fromStatus: job.status,
+        toStatus: job.status,
+        changedBy: req.user._id,
+        changedAt: new Date(),
+        notes: `${changedFieldName} is deleted by ${actorWithRole(req.user)}.`,
+      });
+      await job.save();
+      if (oldKey) {
+        await deleteObject(oldKey).catch(() => {});
+      }
+      notifyAssignmentDocumentChange({
+        job,
+        documentFieldName: changedFieldName,
+        action: 'deleted',
+        actorUser: req.user,
+      });
+      broadcastJobUpdate();
+      return res.json({
+        success: true,
+        data: { assignmentDocumentRequirements: job.assignmentDocumentRequirements },
+        message: 'Assignment document deleted',
+      });
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
     }
   }
 );
@@ -1023,11 +1625,36 @@ router.patch(
         return res.status(404).json({ success: false, error: 'Job not found' });
       }
 
+      const prevChecklist = {
+        firstPageReceived: Boolean(job.assignmentChecklist?.firstPageReceived),
+        printsDrawingsReceived: Boolean(job.assignmentChecklist?.printsDrawingsReceived),
+        siteContactInfoReceived: Boolean(job.assignmentChecklist?.siteContactInfoReceived),
+      };
+
       const nextChecklist = {
         firstPageReceived: Boolean(req.body.firstPageReceived ?? job.assignmentChecklist?.firstPageReceived),
         printsDrawingsReceived: Boolean(req.body.printsDrawingsReceived ?? job.assignmentChecklist?.printsDrawingsReceived),
         siteContactInfoReceived: Boolean(req.body.siteContactInfoReceived ?? job.assignmentChecklist?.siteContactInfoReceived),
       };
+
+      const labelByKey = {
+        firstPageReceived: 'First page received',
+        printsDrawingsReceived: 'Prints/drawings received',
+        siteContactInfoReceived: 'Site contact info received',
+      };
+      const summaryLines = [];
+      for (const key of Object.keys(labelByKey)) {
+        if (prevChecklist[key] !== nextChecklist[key]) {
+          summaryLines.push(`${labelByKey[key]}: ${nextChecklist[key] ? 'yes' : 'no'}`);
+        }
+      }
+
+      if (!summaryLines.length) {
+        await job.populate('assignedTechnician', 'name email certificates');
+        await job.populate('secondaryAssignedTechnician', 'name email certificates');
+        await job.populate('createdBy', 'name email');
+        return res.json({ success: true, data: job, message: 'Assignment checklist unchanged' });
+      }
 
       job.assignmentChecklist = nextChecklist;
       for (let i = job.statusHistory.length - 1; i >= 0; i -= 1) {
@@ -1035,6 +1662,20 @@ router.patch(
           job.statusHistory[i].assignmentChecklist = nextChecklist;
           break;
         }
+      }
+      if (summaryLines.length) {
+        job.statusHistory.push({
+          fromStatus: job.status,
+          toStatus: job.status,
+          changedBy: req.user._id,
+          changedAt: new Date(),
+          notes: `Assignment checklist updated by ${actorWithRole(req.user)}: ${summaryLines.join('; ')}.`,
+        });
+        notifyAssignmentChecklistUpdated({
+          job,
+          summaryLines,
+          actorUser: req.user,
+        });
       }
       await job.save();
       await job.populate('assignedTechnician', 'name email certificates');
@@ -1189,6 +1830,7 @@ router.put(
   [
     body('title').optional().notEmpty().withMessage('Title cannot be empty'),
     body('jobType').optional().isString().withMessage('Job type must be a string'),
+    body('programmingSubtype').optional().isString().withMessage('Programming subtype must be a string'),
     body('customerEmail').optional().isEmail().withMessage('Invalid customer email'),
     body('scheduledDate').optional().custom(validateScheduledDate),
     body('estimatedCost').optional().isFloat({ min: 0 }).withMessage('Must be positive'),
@@ -1202,8 +1844,11 @@ router.put(
 
     try {
       // Prevent editing BILLED jobs
-      const existingJob = await Job.findById(req.params.id);
-      if (existingJob && existingJob.status === JOB_STATUS.BILLED) {
+      const existingJob = await Job.findById(req.params.id).lean();
+      if (!existingJob) {
+        return res.status(404).json({ success: false, error: 'Job not found' });
+      }
+      if (existingJob.status === JOB_STATUS.BILLED) {
         return res.status(400).json({ success: false, error: 'Billed jobs cannot be edited' });
       }
 
@@ -1213,6 +1858,29 @@ router.put(
           return res.status(400).json({ success: false, error: 'Job type cannot be empty' });
         }
         await ensureJobTypeSaved(req.body.jobType);
+      }
+
+      if (req.body.jobType !== undefined || req.body.programmingSubtype !== undefined) {
+        const finalJobType = normalizeJobType(
+          req.body.jobType !== undefined ? req.body.jobType : existingJob.jobType,
+        );
+        const normSubtype = normalizeProgrammingSubtype(
+          req.body.programmingSubtype !== undefined
+            ? req.body.programmingSubtype
+            : (existingJob.programmingSubtype || ''),
+        );
+        if (await jobTypeIsProgramming(finalJobType)) {
+          if (!normSubtype || !PROGRAMMING_SUBTYPES.includes(normSubtype)) {
+            return res.status(400).json({
+              success: false,
+              error:
+                'Programming subtype is required and must be "New Start-Up" or "Existing Start-Up" for programming job types',
+            });
+          }
+          req.body.programmingSubtype = normSubtype;
+        } else {
+          req.body.programmingSubtype = undefined;
+        }
       }
 
       const result = await JobService.updateJobDetails(req.params.id, req.body);

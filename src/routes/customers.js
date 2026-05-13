@@ -17,7 +17,7 @@ router.get(
     try {
       const customers = await Customer.find()
         .sort({ name: 1 })
-        .select('name phone email address');
+        .select('name phone email address firstPageRequired');
       res.json({ success: true, data: customers });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
@@ -95,6 +95,7 @@ router.put(
     body('phone').optional().trim(),
     body('email').optional({ checkFalsy: true }).isEmail().withMessage('Invalid email').normalizeEmail(),
     body('address').optional().trim(),
+    body('firstPageRequired').optional().isBoolean().withMessage('firstPageRequired must be true or false'),
   ],
   async (req, res) => {
     const errors = validationResult(req);

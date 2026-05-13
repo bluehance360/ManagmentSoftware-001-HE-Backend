@@ -12,6 +12,7 @@
 const mongoose = require('mongoose');
 const Job = require('../models/Job');
 const User = require('../models/User');
+const Customer = require('../models/Customer');
 const JobType = require('../models/JobType');
 const TechTimeout = require('../models/TechTimeout');
 const { ROLES, JOB_STATUS, STATUS_TRANSITIONS, TIMEOUT_REQUEST_STATUS } = require('../config/constants');
@@ -255,9 +256,10 @@ async function assignTechnician(
   user,
   notes,
   assignmentChecklist = {},
-  secondaryTechnicianId = null
+  secondaryTechnicianId = null,
+  assignmentDocumentRequirements = []
 ) {
-  const jobForSchedule = await Job.findById(jobId).select('scheduledDate jobType').lean();
+  const jobForSchedule = await Job.findById(jobId).select('scheduledDate jobType customer').lean();
   if (!jobForSchedule) return { error: 'Job not found', status: 404 };
 
   // 1) Verify technician exists and has correct role
@@ -314,12 +316,52 @@ async function assignTechnician(
   const certError = await ensureTechCertifiedForJobType(jobForSchedule.jobType, [technicianId]);
   if (certError) return { error: certError, status: 400 };
 
+  // 2e) Customer may require first page on file before assignment
+  if (jobForSchedule?.customer) {
+    const cust = await Customer.findById(jobForSchedule.customer).select('firstPageRequired').lean();
+    if (cust?.firstPageRequired && !Boolean(assignmentChecklist?.firstPageReceived)) {
+      return {
+        error:
+          'This customer requires first page on file — check "First page received" on the assignment checklist before assigning.',
+        status: 400,
+      };
+    }
+  }
+
   // 3) Atomic: only matches if status is still CONFIRMED
   const checklist = {
     firstPageReceived: Boolean(assignmentChecklist?.firstPageReceived),
     printsDrawingsReceived: Boolean(assignmentChecklist?.printsDrawingsReceived),
     siteContactInfoReceived: Boolean(assignmentChecklist?.siteContactInfoReceived),
   };
+
+  const normalizedAssignmentRequirements = Array.isArray(assignmentDocumentRequirements)
+    ? assignmentDocumentRequirements.map((row) => ({
+        key: String(row?.key || '').trim(),
+        label: String(row?.label || '').trim(),
+        checked: Boolean(row?.checked),
+        textValue: String(row?.textValue || '').trim(),
+        document: row?.document?.key
+          ? {
+              key: String(row.document.key).trim(),
+              fileName: String(row.document.fileName || '').trim(),
+              contentType: String(row.document.contentType || 'application/octet-stream').trim(),
+              size: Number(row.document.size || 0),
+              uploadedBy: row.document.uploadedBy || null,
+              uploadedAt: row.document.uploadedAt || null,
+            }
+          : null,
+      }))
+    : [];
+  const missingDoc = normalizedAssignmentRequirements.find(
+    (row) => row.checked && (!row.document || !row.document.key) && !row.textValue
+  );
+  if (missingDoc) {
+    return {
+      error: `Provide document or text for "${missingDoc.label}" before assigning`,
+      status: 400,
+    };
+  }
 
   const historyEntry = {
     _id: new mongoose.Types.ObjectId(),
@@ -340,6 +382,7 @@ async function assignTechnician(
         assignedTechnician: technicianId,
         secondaryAssignedTechnician: secondaryTechnicianId || null,
         assignmentChecklist: checklist,
+        assignmentDocumentRequirements: normalizedAssignmentRequirements,
       },
       $push: { statusHistory: historyEntry },
     },
