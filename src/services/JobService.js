@@ -106,7 +106,15 @@ const POPULATE_FIELDS = [
   { path: 'statusHistory.changedBy', select: 'name email role' },
   { path: 'statusHistory.technician', select: 'name email' },
   { path: 'documents.uploadedBy', select: 'name email role' },
-  { path: 'customer', select: 'name phone email address' },
+  { path: 'customer', select: 'name phone email address firstPageRequired' },
+  {
+    path: 'parentJob',
+    select: 'title scheduledDate status assignedTechnician secondaryAssignedTechnician',
+    populate: [
+      { path: 'assignedTechnician', select: 'name email' },
+      { path: 'secondaryAssignedTechnician', select: 'name email' },
+    ],
+  },
 ];
 
 /**
@@ -201,6 +209,30 @@ async function transitionStatus(jobId, newStatus, user, notes) {
   // 2b) Notes are required when moving to IN_PROGRESS (tech starting work)
   if (newStatus === JOB_STATUS.IN_PROGRESS && (!notes || !notes.trim())) {
     return { error: 'Notes are required when starting a job', status: 400 };
+  }
+
+  // 2b2) Incomplete / Return: cannot start work while request is pending or approved (OK again after REJECTED / cleared)
+  if (currentStatus === JOB_STATUS.ASSIGNED && newStatus === JOB_STATUS.IN_PROGRESS) {
+    const irs = job.incompleteReturnRequest?.status;
+    if (irs === 'PENDING' || irs === 'APPROVED') {
+      return {
+        error:
+          'Start work is disabled while an Incomplete / Return request is pending or approved. It becomes available again if that request is rejected.',
+        status: 400,
+      };
+    }
+  }
+
+  // 2c) Our-issue path: cannot complete until Admin/Manager approves
+  if (currentStatus === JOB_STATUS.IN_PROGRESS && newStatus === JOB_STATUS.COMPLETED) {
+    const ow = job.returnWorkflow?.ourIssue;
+    if (ow?.techRequestedAdminContact && ow.reviewStatus !== 'APPROVED') {
+      return {
+        error:
+          'This job is flagged for an internal (our) issue review. An Admin or Office Manager must approve before it can be marked completed.',
+        status: 400,
+      };
+    }
   }
 
   // 3) Technician must be the one assigned

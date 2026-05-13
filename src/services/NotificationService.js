@@ -83,7 +83,7 @@ async function createNotification({
       badge: '/Hosanna-logo.webp',
       data: {
         url: jobId
-          ? '/jobs'
+          ? `/jobs?openJob=${jobId}`
           : type === 'TEAM_MEMBER_JOINED'
             ? '/team'
             : timeoutRouteTypes.has(type)

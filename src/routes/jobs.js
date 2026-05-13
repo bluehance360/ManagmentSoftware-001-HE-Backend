@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const { body, param, validationResult } = require('express-validator');
 const Job = require('../models/Job');
 const JobType = require('../models/JobType');
@@ -126,13 +127,13 @@ function buildAssignmentRequirementRows(requirements, previousRows = []) {
       textValue: String(previous?.textValue || '').trim(),
       document: previous?.document?.key
         ? {
-            key: previous.document.key,
-            fileName: previous.document.fileName || '',
-            contentType: previous.document.contentType || 'application/octet-stream',
-            size: Number(previous.document.size || 0),
-            uploadedBy: previous.document.uploadedBy || null,
-            uploadedAt: previous.document.uploadedAt || null,
-          }
+          key: previous.document.key,
+          fileName: previous.document.fileName || '',
+          contentType: previous.document.contentType || 'application/octet-stream',
+          size: Number(previous.document.size || 0),
+          uploadedBy: previous.document.uploadedBy || null,
+          uploadedAt: previous.document.uploadedAt || null,
+        }
         : null,
     };
   });
@@ -234,11 +235,33 @@ function canAccessJob(user, job) {
   if (!job) return false;
   if ([ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(user.role)) return true;
   if (user.role !== ROLES.TECHNICIAN) return false;
-  if (!TECH_VISIBLE_STATUSES.includes(job.status)) return false;
+
+  const userId = user._id.toString();
   const primaryTechId = job.assignedTechnician?._id || job.assignedTechnician;
   const secondaryTechId = job.secondaryAssignedTechnician?._id || job.secondaryAssignedTechnician;
-  const userId = user._id.toString();
-  return primaryTechId?.toString() === userId || secondaryTechId?.toString() === userId;
+  const selfAssigned =
+    primaryTechId?.toString() === userId || secondaryTechId?.toString() === userId;
+
+  if (selfAssigned && TECH_VISIBLE_STATUSES.includes(job.status)) return true;
+
+  const extendedReturnStatuses = [
+    JOB_STATUS.TENTATIVE,
+    JOB_STATUS.CONFIRMED,
+    ...TECH_VISIBLE_STATUSES,
+  ];
+  if (
+    job.jobVisitKind === 'RETURN' &&
+    job.parentJob &&
+    extendedReturnStatuses.includes(job.status)
+  ) {
+    const parent = job.parentJob;
+    const p1 = parent.assignedTechnician?._id || parent.assignedTechnician;
+    const p2 = parent.secondaryAssignedTechnician?._id || parent.secondaryAssignedTechnician;
+    const parentAssigned = p1?.toString() === userId || p2?.toString() === userId;
+    if (parentAssigned) return true;
+  }
+
+  return false;
 }
 
 function normalizeDocNote(note) {
@@ -337,6 +360,80 @@ function notifyAssignmentRequirementNoteChanges({ job, entries, actorUser }) {
   });
 }
 
+const RETURN_WORKFLOW_REASONS = ['NONE', 'RETURN_VISIT', 'MANUFACTURER', 'OUR_ISSUE'];
+const RMA_STATUSES = ['ORDERED', 'WAITING', 'RECEIVED'];
+const OUR_ISSUE_REVIEW_STATUSES = ['NONE', 'PENDING', 'APPROVED', 'REJECTED'];
+
+function techAssignedToJob(job, userId) {
+  if (!job) return false;
+  const uid = userId.toString();
+  const p1 = job.assignedTechnician?._id || job.assignedTechnician;
+  const p2 = job.secondaryAssignedTechnician?._id || job.secondaryAssignedTechnician;
+  return p1?.toString() === uid || p2?.toString() === uid;
+}
+
+/** Job document that owns `returnWorkflow` (never the return child row). */
+async function loadReturnWorkflowTargetJob(jobId) {
+  const job = await Job.findById(jobId)
+    .select(
+      '_id title status customer companyName customerName customerPhone customerEmail address scheduledDate jobType programmingSubtype estimatedCost notes assignedTechnician secondaryAssignedTechnician createdBy parentJob jobVisitKind returnWorkflow description'
+    )
+    .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
+  if (!job) return null;
+  if (job.parentJob) {
+    const parentId = job.parentJob._id || job.parentJob;
+    return Job.findById(parentId).select(
+      '_id title status customer companyName customerName customerPhone customerEmail address scheduledDate jobType programmingSubtype estimatedCost notes assignedTechnician secondaryAssignedTechnician createdBy parentJob jobVisitKind returnWorkflow description'
+    );
+  }
+  return job;
+}
+
+function canEditReturnWorkflow(user, workflowJob) {
+  if (!workflowJob) return false;
+  if ([ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(user.role)) return canAccessJob(user, workflowJob);
+  if (user.role === ROLES.TECHNICIAN) {
+    if (![JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS].includes(workflowJob.status)) return false;
+    return techAssignedToJob(workflowJob, user._id);
+  }
+  return false;
+}
+
+function pushStatusHistoryNote(job, userId, notesText) {
+  if (!Array.isArray(job.statusHistory)) {
+    job.statusHistory = [];
+  }
+  job.statusHistory.push({
+    _id: new mongoose.Types.ObjectId(),
+    fromStatus: job.status,
+    toStatus: job.status,
+    changedBy: userId,
+    notes: notesText,
+  });
+}
+
+/** Only Admin / Office Manager, after technician request is approved. */
+function canCreateReturnVisitJob(user, parentJob) {
+  if (!parentJob || parentJob.parentJob) return false;
+  if (![ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(user.role)) return false;
+  if (!canAccessJob(user, parentJob)) return false;
+  return parentJob.incompleteReturnRequest?.status === 'APPROVED';
+}
+
+function canSubmitIncompleteReturnRequest(user, parentJob) {
+  if (!parentJob || parentJob.parentJob) return false;
+  if (![JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS].includes(parentJob.status)) return false;
+  if ([ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(user.role)) {
+    return canAccessJob(user, parentJob);
+  }
+  if (user.role === ROLES.TECHNICIAN) {
+    return techAssignedToJob(parentJob, user._id);
+  }
+  return false;
+}
+
+const INCOMPLETE_RETURN_REASON_TYPES = ['MANUFACTURER', 'OUR_ISSUE'];
+
 router.use(authenticate);
 
 // ── GET /api/jobs ────────────────────────────────────────────────────
@@ -346,11 +443,6 @@ router.get('/', async (req, res) => {
     const filter = {};
 
     if (req.user.role === ROLES.TECHNICIAN) {
-      filter.$or = [
-        { assignedTechnician: req.user._id },
-        { secondaryAssignedTechnician: req.user._id },
-      ];
-      // Technicians see all assigned jobs immediately
       const techVisibleStatuses = [
         JOB_STATUS.ASSIGNED,
         JOB_STATUS.IN_PROGRESS,
@@ -359,9 +451,48 @@ router.get('/', async (req, res) => {
         JOB_STATUS.PAID,
         JOB_STATUS.CLOSED,
       ];
-      filter.status = status
-        ? (techVisibleStatuses.includes(status) ? status : '__none__')
-        : { $in: techVisibleStatuses };
+      const returnExtraStatuses = [JOB_STATUS.TENTATIVE, JOB_STATUS.CONFIRMED];
+      const statusConstraint = status
+        ? techVisibleStatuses.includes(status) || returnExtraStatuses.includes(status)
+          ? { status }
+          : { status: '__none__' }
+        : null;
+
+      const myParentIds = await Job.find({
+        $or: [
+          { assignedTechnician: req.user._id },
+          { secondaryAssignedTechnician: req.user._id },
+        ],
+      }).distinct('_id');
+
+      const returnVisitBranch =
+        myParentIds.length > 0
+          ? {
+            $and: [
+              { parentJob: { $in: myParentIds } },
+              { jobVisitKind: 'RETURN' },
+              statusConstraint
+                ? statusConstraint
+                : { status: { $in: [...techVisibleStatuses, ...returnExtraStatuses] } },
+            ],
+          }
+          : { _id: { $exists: false } };
+
+      const assignedBranch = {
+        $and: [
+          {
+            $or: [
+              { assignedTechnician: req.user._id },
+              { secondaryAssignedTechnician: req.user._id },
+            ],
+          },
+          statusConstraint
+            ? statusConstraint
+            : { status: { $in: techVisibleStatuses } },
+        ],
+      };
+
+      filter.$or = [assignedBranch, returnVisitBranch];
     } else if (req.user.role === ROLES.OFFICE_MANAGER) {
       // Managers see everything including TENTATIVE
       const managerVisibleStatuses = [
@@ -395,6 +526,7 @@ router.get('/', async (req, res) => {
         .populate('secondaryAssignedTechnician', 'name email')
         .populate('createdBy', 'name email')
         .populate('customer', 'name phone email address firstPageRequired')
+        .populate('parentJob', 'title scheduledDate status')
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parseInt(limit)),
@@ -489,8 +621,8 @@ router.post(
         documentRequirements: sanitizeDocumentRequirements(req.body.documentRequirements),
         programmingDocumentRequirements: isProgramming
           ? sanitizeProgrammingRequirements(
-              req.body.programmingDocumentRequirements || defaults
-            )
+            req.body.programmingDocumentRequirements || defaults
+          )
           : sanitizeProgrammingRequirements(req.body.programmingDocumentRequirements),
       });
       const jobTypes = await listJobTypesWithUsage();
@@ -612,33 +744,13 @@ router.get('/:id', async (req, res) => {
       .populate('customer', 'name phone email address firstPageRequired')
       .populate('statusHistory.changedBy', 'name email role')
       .populate('statusHistory.technician', 'name email')
-      .populate('documents.uploadedBy', 'name email role');
+      .populate('documents.uploadedBy', 'name email role')
+      .populate('parentJob', 'title scheduledDate status assignedTechnician secondaryAssignedTechnician');
 
     if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
 
-    // TENTATIVE jobs are visible to ADMIN and OFFICE_MANAGER
-    if (job.status === JOB_STATUS.TENTATIVE && ![ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(req.user.role)) {
+    if (!canAccessJob(req.user, job)) {
       return res.status(403).json({ success: false, error: 'Not authorized to view this job' });
-    }
-
-    // Technicians can only see ASSIGNED+ jobs
-    if (req.user.role === ROLES.TECHNICIAN) {
-      const techVisibleStatuses = [
-        JOB_STATUS.ASSIGNED,
-        JOB_STATUS.IN_PROGRESS,
-        JOB_STATUS.COMPLETED,
-        JOB_STATUS.BILLED,
-        JOB_STATUS.PAID,
-        JOB_STATUS.CLOSED,
-      ];
-      if (!techVisibleStatuses.includes(job.status)) {
-        return res.status(403).json({ success: false, error: 'Not authorized to view this job' });
-      }
-      const primaryTechId = job.assignedTechnician?._id?.toString();
-      const secondaryTechId = job.secondaryAssignedTechnician?._id?.toString();
-      if (primaryTechId !== req.user._id.toString() && secondaryTechId !== req.user._id.toString()) {
-        return res.status(403).json({ success: false, error: 'Not authorized to view this job' });
-      }
     }
 
     const resolvedRequirements = await resolveAssignmentRequirementsForJob(job);
@@ -646,7 +758,18 @@ router.get('/:id', async (req, res) => {
       job.assignmentDocumentRequirements = resolvedRequirements;
     }
 
-    res.json({ success: true, data: job });
+    const returnVisitJobs = await Job.find({
+      parentJob: job._id,
+      jobVisitKind: 'RETURN',
+    })
+      .select('title scheduledDate status _id jobVisitKind parentJob')
+      .sort({ scheduledDate: 1 })
+      .lean();
+
+    const data = job.toObject();
+    data.returnVisitJobs = returnVisitJobs;
+
+    res.json({ success: true, data });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -737,7 +860,9 @@ router.post(
     }
 
     try {
-      const job = await Job.findById(req.params.id).select('_id title status assignedTechnician secondaryAssignedTechnician');
+      const job = await Job.findById(req.params.id)
+        .select('_id title status assignedTechnician secondaryAssignedTechnician parentJob jobVisitKind')
+        .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
       if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
       if (!canAccessJob(req.user, job)) {
         return res.status(403).json({ success: false, error: 'Not authorized to upload documents for this job' });
@@ -799,8 +924,9 @@ router.post(
 
     try {
       const job = await Job.findById(req.params.id)
-        .select('_id title status assignedTechnician secondaryAssignedTechnician documents')
-        .populate('assignedTechnician', 'name email');
+        .select('_id title status assignedTechnician secondaryAssignedTechnician documents parentJob jobVisitKind')
+        .populate('assignedTechnician', 'name email')
+        .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
 
       if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
       if (!canAccessJob(req.user, job)) {
@@ -863,7 +989,8 @@ router.post(
 router.get('/:id/documents/:docId/url', async (req, res) => {
   try {
     const job = await Job.findById(req.params.id)
-      .select('_id status assignedTechnician secondaryAssignedTechnician documents');
+      .select('_id status assignedTechnician secondaryAssignedTechnician documents parentJob jobVisitKind')
+      .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
 
     if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
     if (!canAccessJob(req.user, job)) {
@@ -897,8 +1024,9 @@ router.get('/:id/documents/:docId/url', async (req, res) => {
 router.delete('/:id/documents/:docId', async (req, res) => {
   try {
     const job = await Job.findById(req.params.id)
-      .select('_id title status assignedTechnician secondaryAssignedTechnician documents')
-      .populate('assignedTechnician', 'name email');
+      .select('_id title status assignedTechnician secondaryAssignedTechnician documents parentJob jobVisitKind')
+      .populate('assignedTechnician', 'name email')
+      .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
 
     if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
     if (!canAccessJob(req.user, job)) {
@@ -948,6 +1076,511 @@ router.delete('/:id/documents/:docId', async (req, res) => {
   }
 });
 
+// ── POST /api/jobs/:id/incomplete-return-request (TECHNICIAN or ADMIN / OFFICE_MANAGER) ──
+router.post(
+  '/:id/incomplete-return-request',
+  [
+    param('id').isMongoId().withMessage('Invalid job ID'),
+    body('reasonType').isIn(INCOMPLETE_RETURN_REASON_TYPES).withMessage('Invalid reason type'),
+    body('describeReason').optional().isString(),
+    body('manufacturer').optional().isObject(),
+    body('manufacturer.partsNeeded').optional().isString(),
+    body('manufacturer.rmaStatus').optional().isIn(RMA_STATUSES).withMessage('Invalid RMA status'),
+    body('needsManagerContactStatic').optional().isBoolean(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const parent = await Job.findById(req.params.id)
+        .select(
+          '_id title status assignedTechnician secondaryAssignedTechnician parentJob incompleteReturnRequest statusHistory'
+        )
+        .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
+
+      if (!parent) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (parent.parentJob) {
+        return res.status(400).json({ success: false, error: 'Use the original job, not a return visit row' });
+      }
+      if (!canSubmitIncompleteReturnRequest(req.user, parent)) {
+        return res.status(403).json({
+          success: false,
+          error:
+            'You are not allowed to submit an Incomplete / Return request for this job (assigned technician, admin, or office manager with access only).',
+        });
+      }
+      if (parent.incompleteReturnRequest?.status === 'PENDING') {
+        return res.status(400).json({ success: false, error: 'An Incomplete / Return request is already pending approval.' });
+      }
+
+      const reasonType = req.body.reasonType;
+      const describeReason = String(req.body.describeReason || '').trim();
+      const needsManagerContactStatic = Boolean(req.body.needsManagerContactStatic);
+      let manufacturer = { partsNeeded: '', rmaStatus: 'WAITING' };
+      if (reasonType === 'MANUFACTURER') {
+        manufacturer.partsNeeded = String(req.body.manufacturer?.partsNeeded || '').trim();
+        const rma = req.body.manufacturer?.rmaStatus || 'WAITING';
+        manufacturer.rmaStatus = RMA_STATUSES.includes(rma) ? rma : 'WAITING';
+        if (!manufacturer.partsNeeded) {
+          return res.status(400).json({
+            success: false,
+            error: 'Parts needed is required for manufacturer issues.',
+          });
+        }
+      }
+      if (reasonType === 'OUR_ISSUE' && !describeReason) {
+        return res.status(400).json({
+          success: false,
+          error: 'Describe reason is required for our issue.',
+        });
+      }
+
+      const storedDescribeReason = reasonType === 'OUR_ISSUE' ? describeReason : '';
+
+      parent.incompleteReturnRequest = {
+        status: 'PENDING',
+        reasonType,
+        describeReason: storedDescribeReason,
+        needsManagerContactStatic,
+        manufacturer: reasonType === 'MANUFACTURER' ? manufacturer : { partsNeeded: '', rmaStatus: 'WAITING' },
+        submittedBy: req.user._id,
+        submittedAt: new Date(),
+        reviewedBy: null,
+        reviewedAt: null,
+        adminReviewNotes: '',
+      };
+      parent.markModified('incompleteReturnRequest');
+      pushStatusHistoryNote(
+        parent,
+        req.user._id,
+        `Incomplete / Return request submitted (${reasonType}) — pending Admin / Office Manager approval.`
+      );
+      await parent.save();
+
+      createNotification({
+        type: 'JOB_INCOMPLETE_RETURN_REQUESTED',
+        message: `${actorWithRole(req.user)} submitted an Incomplete / Return request for "${parent.title}" (approval required).`,
+        jobId: parent._id,
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        excludeUserId: req.user._id,
+      });
+
+      broadcastJobUpdate();
+      const updated = await Job.findById(parent._id).populate([
+        { path: 'assignedTechnician', select: 'name email' },
+        { path: 'secondaryAssignedTechnician', select: 'name email' },
+      ]);
+      res.status(201).json({ success: true, data: updated });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── PATCH /api/jobs/:id/incomplete-return-request/review ─────────────
+router.patch(
+  '/:id/incomplete-return-request/review',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  [
+    param('id').isMongoId().withMessage('Invalid job ID'),
+    body('decision').isIn(['APPROVED', 'REJECTED']).withMessage('decision must be APPROVED or REJECTED'),
+    body('adminReviewNotes').optional().isString(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const parent = await Job.findById(req.params.id).select(
+        '_id title status assignedTechnician secondaryAssignedTechnician parentJob incompleteReturnRequest statusHistory'
+      );
+
+      if (!parent) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (!canAccessJob(req.user, parent)) {
+        return res.status(403).json({ success: false, error: 'Not authorized' });
+      }
+      if (parent.parentJob) {
+        return res.status(400).json({ success: false, error: 'Not applicable to a return visit row' });
+      }
+      if (parent.incompleteReturnRequest?.status !== 'PENDING') {
+        return res.status(400).json({ success: false, error: 'No pending Incomplete / Return request to review.' });
+      }
+
+      const submittedBy = parent.incompleteReturnRequest.submittedBy;
+      if (submittedBy && String(submittedBy) === String(req.user._id)) {
+        return res.status(400).json({
+          success: false,
+          error: 'You cannot approve or reject an Incomplete / Return request that you submitted. Ask another admin or office manager.',
+        });
+      }
+
+      const decision = req.body.decision;
+      const adminReviewNotes = String(req.body.adminReviewNotes || '').trim();
+
+      parent.incompleteReturnRequest.status = decision;
+      parent.incompleteReturnRequest.reviewedBy = req.user._id;
+      parent.incompleteReturnRequest.reviewedAt = new Date();
+      parent.incompleteReturnRequest.adminReviewNotes = adminReviewNotes;
+      parent.markModified('incompleteReturnRequest');
+
+      const reasonLabel =
+        parent.incompleteReturnRequest.reasonType === 'MANUFACTURER' ? 'Manufacturer issue' : 'Our issue';
+      const reviewLine =
+        decision === 'APPROVED'
+          ? `Incomplete / Return request approved (${reasonLabel}).`
+          : `Incomplete / Return request rejected (${reasonLabel}).${adminReviewNotes ? ` Notes: ${adminReviewNotes}` : ''}`;
+      pushStatusHistoryNote(parent, req.user._id, reviewLine);
+      await parent.save();
+
+      const techRecipients = [];
+      if (parent.assignedTechnician) techRecipients.push(parent.assignedTechnician);
+      if (parent.secondaryAssignedTechnician) techRecipients.push(parent.secondaryAssignedTechnician);
+
+      const type =
+        decision === 'APPROVED' ? 'JOB_INCOMPLETE_RETURN_APPROVED' : 'JOB_INCOMPLETE_RETURN_REJECTED';
+      const msg =
+        decision === 'APPROVED'
+          ? `${actorWithRole(req.user)} approved the Incomplete / Return request for "${parent.title}".`
+          : `${actorWithRole(req.user)} rejected the Incomplete / Return request for "${parent.title}".`;
+
+      createNotification({
+        type,
+        message: msg,
+        jobId: parent._id,
+        recipientIds: techRecipients,
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        excludeUserId: req.user._id,
+      });
+
+      broadcastJobUpdate();
+      const updated = await Job.findById(parent._id).populate([
+        { path: 'assignedTechnician', select: 'name email' },
+        { path: 'secondaryAssignedTechnician', select: 'name email' },
+      ]);
+
+      res.json({
+        success: true,
+        data: updated,
+        openSetReturnVisit: decision === 'APPROVED',
+      });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── POST /api/jobs/:id/return-visit (ADMIN, OFFICE_MANAGER) ──────────
+router.post(
+  '/:id/return-visit',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  [
+    param('id').isMongoId().withMessage('Invalid job ID'),
+    body('scheduledDate').notEmpty().withMessage('Return date is required').custom(validateScheduledDate),
+    body('notes').optional().isString(),
+    body('paymentDiscussionNeeded').optional().isBoolean(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const parent = await Job.findById(req.params.id)
+        .select(
+          '_id title description status customer companyName customerName customerPhone customerEmail address jobType programmingSubtype estimatedCost notes assignedTechnician secondaryAssignedTechnician createdBy parentJob jobVisitKind returnWorkflow incompleteReturnRequest'
+        )
+        .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
+
+      if (!parent) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (parent.parentJob) {
+        return res.status(400).json({ success: false, error: 'Return visits can only be created from the original job, not a return row' });
+      }
+      if (!canCreateReturnVisitJob(req.user, parent)) {
+        if (parent.incompleteReturnRequest?.status !== 'APPROVED') {
+          return res.status(403).json({
+            success: false,
+            error:
+              'The technician’s Incomplete / Return request must be approved before you can schedule a return visit.',
+          });
+        }
+        return res.status(403).json({ success: false, error: 'Not authorized to create a return visit for this job.' });
+      }
+
+      const normalizedDate = normalizeDateOnly(req.body.scheduledDate);
+      const notes = typeof req.body.notes === 'string' ? req.body.notes.trim() : '';
+      const paymentDiscussionNeeded =
+        req.body.paymentDiscussionNeeded === undefined ? true : Boolean(req.body.paymentDiscussionNeeded);
+
+      const childData = {
+        title: `${parent.title} (Return)`,
+        description: parent.description || '',
+        customer: parent.customer,
+        companyName: parent.companyName,
+        customerName: parent.customerName,
+        customerPhone: parent.customerPhone,
+        customerEmail: parent.customerEmail,
+        address: parent.address,
+        scheduledDate: normalizedDate,
+        status: JOB_STATUS.TENTATIVE,
+        createdBy: req.user._id,
+        parentJob: parent._id,
+        jobVisitKind: 'RETURN',
+        jobType: parent.jobType,
+        programmingSubtype: parent.programmingSubtype,
+        estimatedCost: parent.estimatedCost,
+        notes: notes || undefined,
+        statusHistory: [
+          {
+            fromStatus: null,
+            toStatus: JOB_STATUS.TENTATIVE,
+            changedBy: req.user._id,
+            notes: 'Return visit scheduled',
+          },
+        ],
+      };
+
+      const child = await Job.create(childData);
+      await child.populate([
+        { path: 'assignedTechnician', select: 'name email' },
+        { path: 'secondaryAssignedTechnician', select: 'name email' },
+        { path: 'createdBy', select: 'name email' },
+        { path: 'customer', select: 'name phone email address firstPageRequired' },
+        { path: 'parentJob', select: 'title scheduledDate status' },
+      ]);
+
+      if (!parent.returnWorkflow) parent.returnWorkflow = {};
+      parent.returnWorkflow.reason = 'RETURN_VISIT';
+      parent.returnWorkflow.returnNotes = notes;
+      parent.returnWorkflow.paymentDiscussionNeeded = paymentDiscussionNeeded;
+      parent.markModified('returnWorkflow');
+
+      parent.incompleteReturnRequest = {
+        status: 'NONE',
+        describeReason: '',
+        needsManagerContactStatic: false,
+        manufacturer: { partsNeeded: '', rmaStatus: 'WAITING' },
+      };
+      parent.markModified('incompleteReturnRequest');
+
+      pushStatusHistoryNote(
+        parent,
+        req.user._id,
+        `Return visit job created for ${normalizedDate} (linked child job).`
+      );
+      await parent.save();
+
+      const techRecipients = [];
+      if (parent.assignedTechnician) techRecipients.push(parent.assignedTechnician);
+      if (parent.secondaryAssignedTechnician) techRecipients.push(parent.secondaryAssignedTechnician);
+
+      const payHint = paymentDiscussionNeeded ? ' Payment / billing may need coordination.' : '';
+      createNotification({
+        type: 'JOB_RETURN_VISIT_CREATED',
+        message: `${actorWithRole(req.user)} scheduled a return visit for "${parent.title}" on ${normalizedDate}.${payHint}`,
+        jobId: parent._id,
+        recipientIds: techRecipients,
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        excludeUserId: req.user._id,
+      });
+
+      broadcastJobUpdate();
+      res.status(201).json({ success: true, data: { childJob: child, parentJob: parent } });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── PATCH /api/jobs/:id/return-workflow ─────────────────────────────
+router.patch(
+  '/:id/return-workflow',
+  [
+    param('id').isMongoId().withMessage('Invalid job ID'),
+    body('reason').optional().isIn(RETURN_WORKFLOW_REASONS).withMessage('Invalid reason'),
+    body('returnNotes').optional().isString(),
+    body('paymentDiscussionNeeded').optional().isBoolean(),
+    body('manufacturer').optional().isObject(),
+    body('manufacturer.partsNeeded').optional().isString(),
+    body('manufacturer.rmaStatus').optional().isIn(RMA_STATUSES).withMessage('Invalid RMA status'),
+    body('ourIssue').optional().isObject(),
+    body('ourIssue.techRequestedAdminContact').optional().isBoolean(),
+    body('ourIssue.reviewStatus').optional().isIn(OUR_ISSUE_REVIEW_STATUSES).withMessage('Invalid review status'),
+    body('ourIssue.reviewNotes').optional().isString(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const workflowJob = await loadReturnWorkflowTargetJob(req.params.id);
+      if (!workflowJob) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (!canEditReturnWorkflow(req.user, workflowJob)) {
+        return res.status(403).json({ success: false, error: 'Not authorized to update return workflow' });
+      }
+
+      if (!workflowJob.returnWorkflow) {
+        workflowJob.returnWorkflow = {};
+      }
+
+      const isPrivileged = [ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(req.user.role);
+      const prevOur = workflowJob.returnWorkflow?.ourIssue?.techRequestedAdminContact;
+      const prevRma = workflowJob.returnWorkflow?.manufacturer?.rmaStatus;
+      const prevParts = workflowJob.returnWorkflow?.manufacturer?.partsNeeded;
+
+      if (req.body.reason !== undefined) workflowJob.returnWorkflow.reason = req.body.reason;
+      if (req.body.returnNotes !== undefined) {
+        workflowJob.returnWorkflow.returnNotes = String(req.body.returnNotes || '').trim();
+      }
+      if (req.body.paymentDiscussionNeeded !== undefined) {
+        workflowJob.returnWorkflow.paymentDiscussionNeeded = Boolean(req.body.paymentDiscussionNeeded);
+      }
+
+      if (req.body.manufacturer) {
+        if (req.body.manufacturer.partsNeeded !== undefined) {
+          workflowJob.returnWorkflow.manufacturer = workflowJob.returnWorkflow.manufacturer || {};
+          workflowJob.returnWorkflow.manufacturer.partsNeeded = String(
+            req.body.manufacturer.partsNeeded || ''
+          ).trim();
+        }
+        if (req.body.manufacturer.rmaStatus !== undefined) {
+          workflowJob.returnWorkflow.manufacturer = workflowJob.returnWorkflow.manufacturer || {};
+          workflowJob.returnWorkflow.manufacturer.rmaStatus = req.body.manufacturer.rmaStatus;
+        }
+      }
+
+      if (req.body.ourIssue) {
+        if (!isPrivileged && req.body.ourIssue.reviewStatus !== undefined) {
+          return res.status(403).json({ success: false, error: 'Technicians cannot set review status directly' });
+        }
+        workflowJob.returnWorkflow.ourIssue = workflowJob.returnWorkflow.ourIssue || {};
+        if (req.body.ourIssue.techRequestedAdminContact !== undefined) {
+          const nextFlag = Boolean(req.body.ourIssue.techRequestedAdminContact);
+          workflowJob.returnWorkflow.ourIssue.techRequestedAdminContact = nextFlag;
+          if (!isPrivileged) {
+            if (nextFlag) {
+              if (workflowJob.returnWorkflow.ourIssue.reviewStatus !== 'APPROVED') {
+                workflowJob.returnWorkflow.ourIssue.reviewStatus = 'PENDING';
+              }
+            } else if (workflowJob.returnWorkflow.ourIssue.reviewStatus !== 'APPROVED') {
+              workflowJob.returnWorkflow.ourIssue.reviewStatus = 'NONE';
+              workflowJob.returnWorkflow.ourIssue.reviewNotes = '';
+              workflowJob.returnWorkflow.ourIssue.reviewedBy = null;
+              workflowJob.returnWorkflow.ourIssue.reviewedAt = null;
+            }
+          }
+        }
+        if (isPrivileged) {
+          if (req.body.ourIssue.reviewStatus !== undefined) {
+            workflowJob.returnWorkflow.ourIssue.reviewStatus = req.body.ourIssue.reviewStatus;
+          }
+          if (req.body.ourIssue.reviewNotes !== undefined) {
+            workflowJob.returnWorkflow.ourIssue.reviewNotes = String(req.body.ourIssue.reviewNotes || '').trim();
+          }
+        }
+      }
+
+      workflowJob.markModified('returnWorkflow');
+      await workflowJob.save();
+      await workflowJob.populate([
+        { path: 'assignedTechnician', select: 'name email' },
+        { path: 'secondaryAssignedTechnician', select: 'name email' },
+        { path: 'customer', select: 'name phone email address firstPageRequired' },
+      ]);
+
+      const nextOur = workflowJob.returnWorkflow?.ourIssue?.techRequestedAdminContact;
+      if (!prevOur && nextOur) {
+        createNotification({
+          type: 'JOB_RETURN_REVIEW_REQUESTED',
+          message: `${actorWithRole(req.user)} flagged "${workflowJob.title}" for an internal (our) issue — review required before the job can be completed.`,
+          jobId: workflowJob._id,
+          recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+          excludeUserId: req.user._id,
+        });
+      }
+
+      const nextRma = workflowJob.returnWorkflow?.manufacturer?.rmaStatus;
+      const nextParts = workflowJob.returnWorkflow?.manufacturer?.partsNeeded;
+      const mfgPing =
+        req.body.manufacturer &&
+        (req.body.manufacturer.partsNeeded !== undefined || req.body.manufacturer.rmaStatus !== undefined) &&
+        (nextParts !== prevParts || nextRma !== prevRma);
+      if (mfgPing) {
+        createNotification({
+          type: 'JOB_RETURN_WORKFLOW_UPDATED',
+          message: `${actorWithRole(req.user)} updated manufacturer / RMA details on "${workflowJob.title}" (RMA: ${nextRma}).`,
+          jobId: workflowJob._id,
+          recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+          excludeUserId: req.user._id,
+        });
+      }
+
+      broadcastJobUpdate();
+      res.json({ success: true, data: workflowJob });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── PATCH /api/jobs/:id/our-issue-review ─────────────────────────────
+router.patch(
+  '/:id/our-issue-review',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  [
+    param('id').isMongoId().withMessage('Invalid job ID'),
+    body('reviewStatus').isIn(['APPROVED', 'REJECTED']).withMessage('reviewStatus must be APPROVED or REJECTED'),
+    body('reviewNotes').optional().isString(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const workflowJob = await loadReturnWorkflowTargetJob(req.params.id);
+      if (!workflowJob) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (!canAccessJob(req.user, workflowJob)) {
+        return res.status(403).json({ success: false, error: 'Not authorized' });
+      }
+
+      workflowJob.returnWorkflow = workflowJob.returnWorkflow || {};
+      workflowJob.returnWorkflow.ourIssue = workflowJob.returnWorkflow.ourIssue || {};
+      workflowJob.returnWorkflow.ourIssue.reviewStatus = req.body.reviewStatus;
+      workflowJob.returnWorkflow.ourIssue.reviewNotes = String(req.body.reviewNotes || '').trim();
+      workflowJob.returnWorkflow.ourIssue.reviewedBy = req.user._id;
+      workflowJob.returnWorkflow.ourIssue.reviewedAt = new Date();
+      workflowJob.markModified('returnWorkflow');
+      await workflowJob.save();
+
+      const recipientIds = [];
+      if (workflowJob.assignedTechnician) recipientIds.push(workflowJob.assignedTechnician);
+      if (workflowJob.secondaryAssignedTechnician) recipientIds.push(workflowJob.secondaryAssignedTechnician);
+
+      createNotification({
+        type: 'JOB_RETURN_REVIEW_RESOLVED',
+        message: `${actorWithRole(req.user)} ${req.body.reviewStatus === 'APPROVED' ? 'approved' : 'rejected'} the internal issue review for "${workflowJob.title}".`,
+        jobId: workflowJob._id,
+        recipientIds,
+        excludeUserId: req.user._id,
+      });
+
+      broadcastJobUpdate();
+      res.json({ success: true, data: workflowJob });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
 // ── PATCH /api/jobs/:id/status ──────────────────────────────────────
 router.patch(
   '/:id/status',
@@ -980,23 +1613,23 @@ router.patch(
       const notifRecipientIds = [];
       const notifRoles = [];
       const STATUS_MESSAGES = {
-        CONFIRMED:   `Job "${job.title}" has been confirmed`,
-        ASSIGNED:    `Job "${job.title}" has been assigned`,
+        CONFIRMED: `Job "${job.title}" has been confirmed`,
+        ASSIGNED: `Job "${job.title}" has been assigned`,
         IN_PROGRESS: `Job "${job.title}" is now in progress`,
-        COMPLETED:   `Job "${job.title}" has been completed`,
-        BILLED:      `Job "${job.title}" has been billed`,
-        PAID:        `Job "${job.title}" has been marked as paid`,
-        CLOSED:      `Job "${job.title}" has been closed`,
+        COMPLETED: `Job "${job.title}" has been completed`,
+        BILLED: `Job "${job.title}" has been billed`,
+        PAID: `Job "${job.title}" has been marked as paid`,
+        CLOSED: `Job "${job.title}" has been closed`,
       };
 
       // Notify the relevant people
       if ([JOB_STATUS.IN_PROGRESS, JOB_STATUS.COMPLETED].includes(req.body.status)) {
         const actorIsAdmin = [ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(req.user.role);
-        const statusLabel  = req.body.status === JOB_STATUS.IN_PROGRESS ? 'In Progress' : 'Completed';
-        const techName     = job.assignedTechnician?.name;
+        const statusLabel = req.body.status === JOB_STATUS.IN_PROGRESS ? 'In Progress' : 'Completed';
+        const techName = job.assignedTechnician?.name;
 
         if (actorIsAdmin && techName) {
-     
+
           STATUS_MESSAGES[req.body.status] =
             `"${job.title}" marked as ${statusLabel} on behalf of ${techName}`;
           // Notify the assigned tech
@@ -1122,8 +1755,8 @@ router.patch(
 
       const previousRows = Array.isArray(job.assignmentDocumentRequirements)
         ? job.assignmentDocumentRequirements.map((row) =>
-            row?.toObject ? row.toObject() : { ...row }
-          )
+          row?.toObject ? row.toObject() : { ...row }
+        )
         : [];
 
       const merged = buildAssignmentRequirementRows(
@@ -1135,13 +1768,13 @@ router.patch(
           textValue: String(row?.textValue || '').trim(),
           document: row?.document?.key
             ? {
-                key: row.document.key,
-                fileName: row.document.fileName || '',
-                contentType: row.document.contentType || 'application/octet-stream',
-                size: Number(row.document.size || 0),
-                uploadedBy: row.document.uploadedBy || null,
-                uploadedAt: row.document.uploadedAt || null,
-              }
+              key: row.document.key,
+              fileName: row.document.fileName || '',
+              contentType: row.document.contentType || 'application/octet-stream',
+              size: Number(row.document.size || 0),
+              uploadedBy: row.document.uploadedBy || null,
+              uploadedAt: row.document.uploadedAt || null,
+            }
             : null,
         }))
       );
@@ -1296,7 +1929,7 @@ router.post(
       await job.save();
 
       if (previousKey && previousKey !== req.body.key) {
-        await deleteObject(previousKey).catch(() => {});
+        await deleteObject(previousKey).catch(() => { });
       }
       notifyAssignmentDocumentChange({
         job,
@@ -1383,7 +2016,7 @@ router.delete(
       });
       await job.save();
       if (oldKey) {
-        await deleteObject(oldKey).catch(() => {});
+        await deleteObject(oldKey).catch(() => { });
       }
       notifyAssignmentDocumentChange({
         job,
