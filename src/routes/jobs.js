@@ -139,14 +139,15 @@ function buildAssignmentRequirementRows(requirements, previousRows = []) {
   });
 }
 
-async function resolveAssignmentRequirementsForJob(jobDoc) {
+async function resolveAssignmentRequirementsForJob(jobDoc, overrideRows = null) {
   const normalizedJobType = normalizeJobType(jobDoc?.jobType).toLowerCase();
   if (!normalizedJobType) return [];
   const type = await JobType.findOne({ normalizedName: normalizedJobType }).lean();
   if (!type) return [];
   const defaults = await getProgrammingRequirementDefaults();
   const resolved = resolveJobTypeDocumentRequirements(type, jobDoc?.programmingSubtype, defaults);
-  return buildAssignmentRequirementRows(resolved, jobDoc?.assignmentDocumentRequirements || []);
+  const savedRows = overrideRows !== null ? overrideRows : (jobDoc?.assignmentDocumentRequirements || []);
+  return buildAssignmentRequirementRows(resolved, savedRows);
 }
 
 /** Resolve whether the named job type is a programming type (from DB). */
@@ -229,6 +230,23 @@ async function listJobTypesWithUsage() {
     usageCount: usageMap.get(type.normalizedName)?.usageCount || 0,
     jobTitles: usageMap.get(type.normalizedName)?.jobTitles || [],
   }));
+}
+
+const JOB_DETAIL_POPULATE = [
+  { path: 'assignedTechnician', select: 'name email certificates' },
+  { path: 'secondaryAssignedTechnician', select: 'name email certificates' },
+  { path: 'createdBy', select: 'name email' },
+  { path: 'customer', select: 'name phone email address firstPageRequired' },
+  { path: 'statusHistory.changedBy', select: 'name email role' },
+  { path: 'statusHistory.technician', select: 'name email' },
+  { path: 'documents.uploadedBy', select: 'name email role' },
+  { path: 'parentJob', select: 'title scheduledDate status assignedTechnician secondaryAssignedTechnician' },
+  { path: 'incompleteReturnRequest.submittedBy', select: 'name role' },
+  { path: 'incompleteReturnRequest.reviewedBy', select: 'name role' },
+];
+
+function withJobDetailPopulate(query) {
+  return query.populate(JOB_DETAIL_POPULATE);
 }
 
 function canAccessJob(user, job) {
@@ -412,6 +430,150 @@ function pushStatusHistoryNote(job, userId, notesText) {
   });
 }
 
+function cloneStatusHistoryEntries(entries) {
+  if (!Array.isArray(entries)) return [];
+  return entries
+    .filter((entry) => entry?.toStatus && entry?.changedBy)
+    .map((entry) => ({
+      _id: entry._id || new mongoose.Types.ObjectId(),
+      fromStatus: entry.fromStatus ?? null,
+      toStatus: entry.toStatus,
+      changedBy: entry.changedBy?._id || entry.changedBy,
+      changedAt: entry.changedAt ? new Date(entry.changedAt) : new Date(),
+      notes: String(entry.notes || '').trim(),
+      technician: entry.technician?._id || entry.technician || null,
+      assignmentChecklist: entry.assignmentChecklist
+        ? {
+          firstPageReceived: Boolean(entry.assignmentChecklist.firstPageReceived),
+          printsDrawingsReceived: Boolean(entry.assignmentChecklist.printsDrawingsReceived),
+          siteContactInfoReceived: Boolean(entry.assignmentChecklist.siteContactInfoReceived),
+        }
+        : undefined,
+    }));
+}
+
+function cloneDocumentEntries(entries) {
+  if (!Array.isArray(entries)) return [];
+  return entries
+    .filter((doc) => doc?.key && doc?.fileName)
+    .map((doc) => ({
+      _id: doc._id || new mongoose.Types.ObjectId(),
+      key: String(doc.key).trim(),
+      fileName: String(doc.fileName).trim(),
+      contentType: String(doc.contentType || 'application/octet-stream').trim(),
+      size: Number(doc.size) || 0,
+      note: normalizeDocNote(doc.note),
+      uploadedBy: doc.uploadedBy?._id || doc.uploadedBy,
+      uploadedAt: doc.uploadedAt ? new Date(doc.uploadedAt) : new Date(),
+    }));
+}
+
+function mergeStatusHistoryEntries(...groups) {
+  const byId = new Map();
+  for (const group of groups) {
+    if (!Array.isArray(group)) continue;
+    for (const raw of group) {
+      if (!raw?.toStatus || !raw?.changedBy) continue;
+      const entry = raw?.toObject ? raw.toObject() : { ...raw };
+      const key = String(entry._id || '');
+      if (key && byId.has(key)) continue;
+      byId.set(key || `${entry.toStatus}-${new Date(entry.changedAt || 0).getTime()}`, entry);
+    }
+  }
+  return Array.from(byId.values()).sort((a, b) => {
+    const aTime = new Date(a.changedAt || 0).getTime();
+    const bTime = new Date(b.changedAt || 0).getTime();
+    if (aTime !== bTime) return aTime - bTime;
+    return String(a._id || '').localeCompare(String(b._id || ''));
+  });
+}
+
+function mergeFamilyDocuments(jobs) {
+  const byKey = new Map();
+  for (const job of Array.isArray(jobs) ? jobs : []) {
+    for (const rawDoc of Array.isArray(job?.documents) ? job.documents : []) {
+      const docs = cloneDocumentEntries([rawDoc]);
+      const doc = docs[0];
+      if (!doc?.key || byKey.has(doc.key)) continue;
+      byKey.set(doc.key, {
+        ...doc,
+        uploadedBy:
+          rawDoc?.uploadedBy && typeof rawDoc.uploadedBy === 'object'
+            ? rawDoc.uploadedBy
+            : doc.uploadedBy,
+      });
+    }
+  }
+  return Array.from(byKey.values());
+}
+
+async function loadDocumentFamilyJobs(job) {
+  if (!job?._id) return [];
+  const rootId = job.parentJob?._id || job.parentJob || job._id;
+  return Job.find({
+    $or: [
+      { _id: rootId },
+      { parentJob: rootId, jobVisitKind: 'RETURN' },
+    ],
+  })
+    .select('_id title documents assignedTechnician secondaryAssignedTechnician parentJob jobVisitKind')
+    .populate('documents.uploadedBy', 'name email role');
+}
+
+async function syncAssignmentRequirementsToFamily(job, rows) {
+  const rootId = job.parentJob?._id || job.parentJob || job._id;
+  const familyJobs = await Job.find({
+    $or: [{ _id: rootId }, { parentJob: rootId, jobVisitKind: 'RETURN' }],
+  }).select('_id');
+  const otherIds = familyJobs.map((j) => j._id).filter((id) => String(id) !== String(job._id));
+  if (otherIds.length > 0) {
+    await Job.updateMany({ _id: { $in: otherIds } }, { $set: { assignmentDocumentRequirements: rows } });
+  }
+}
+
+function findDocumentInFamilyJobs(familyJobs, docId) {
+  for (const familyJob of Array.isArray(familyJobs) ? familyJobs : []) {
+    const doc = familyJob.documents?.id ? familyJob.documents.id(docId) : null;
+    if (doc) return { familyJob, doc };
+  }
+  return null;
+}
+
+async function annotateJobsWithLinkedReturnFlag(jobs) {
+  const list = Array.isArray(jobs) ? jobs : [];
+  const rootIds = list
+    .filter((job) => job?._id && !job.parentJob)
+    .map((job) => job._id);
+
+  if (!rootIds.length) {
+    list.forEach((job) => {
+      if (job && typeof job.set === 'function') {
+        job.set('hasLinkedReturnVisit', false, { strict: false });
+      } else if (job) {
+        job.hasLinkedReturnVisit = false;
+      }
+    });
+    return list;
+  }
+
+  const parentIds = await Job.find({
+    parentJob: { $in: rootIds },
+    jobVisitKind: 'RETURN',
+  }).distinct('parentJob');
+  const parentIdSet = new Set(parentIds.map((id) => String(id)));
+
+  list.forEach((job) => {
+    const hasLinkedReturnVisit = !job?.parentJob && parentIdSet.has(String(job?._id || ''));
+    if (job && typeof job.set === 'function') {
+      job.set('hasLinkedReturnVisit', hasLinkedReturnVisit, { strict: false });
+    } else if (job) {
+      job.hasLinkedReturnVisit = hasLinkedReturnVisit;
+    }
+  });
+
+  return list;
+}
+
 /** Only Admin / Office Manager, after technician request is approved. */
 function canCreateReturnVisitJob(user, parentJob) {
   if (!parentJob || parentJob.parentJob) return false;
@@ -532,6 +694,8 @@ router.get('/', async (req, res) => {
         .limit(parseInt(limit)),
       Job.countDocuments(filter),
     ]);
+
+    await annotateJobsWithLinkedReturnFlag(jobs);
 
     res.json({
       success: true,
@@ -737,15 +901,7 @@ router.delete(
 // ── GET /api/jobs/:id ────────────────────────────────────────────────
 router.get('/:id', async (req, res) => {
   try {
-    const job = await Job.findById(req.params.id)
-      .populate('assignedTechnician', 'name email certificates')
-      .populate('secondaryAssignedTechnician', 'name email certificates')
-      .populate('createdBy', 'name email')
-      .populate('customer', 'name phone email address firstPageRequired')
-      .populate('statusHistory.changedBy', 'name email role')
-      .populate('statusHistory.technician', 'name email')
-      .populate('documents.uploadedBy', 'name email role')
-      .populate('parentJob', 'title scheduledDate status assignedTechnician secondaryAssignedTechnician');
+    const job = await withJobDetailPopulate(Job.findById(req.params.id));
 
     if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
 
@@ -753,7 +909,18 @@ router.get('/:id', async (req, res) => {
       return res.status(403).json({ success: false, error: 'Not authorized to view this job' });
     }
 
-    const resolvedRequirements = await resolveAssignmentRequirementsForJob(job);
+    let baseRows = null;
+    if (job.parentJob) {
+      const parentId = job.parentJob?._id || job.parentJob;
+      const parentDoc = await Job.findById(parentId)
+        .select('assignmentDocumentRequirements assignmentChecklist')
+        .lean();
+      baseRows = parentDoc?.assignmentDocumentRequirements || [];
+      if (parentDoc?.assignmentChecklist) {
+        job.assignmentChecklist = parentDoc.assignmentChecklist;
+      }
+    }
+    const resolvedRequirements = await resolveAssignmentRequirementsForJob(job, baseRows);
     if (resolvedRequirements.length > 0) {
       job.assignmentDocumentRequirements = resolvedRequirements;
     }
@@ -762,11 +929,13 @@ router.get('/:id', async (req, res) => {
       parentJob: job._id,
       jobVisitKind: 'RETURN',
     })
-      .select('title scheduledDate status _id jobVisitKind parentJob')
+      .select('title scheduledDate status _id jobVisitKind parentJob assignedTechnician secondaryAssignedTechnician')
       .sort({ scheduledDate: 1 })
       .lean();
 
     const data = job.toObject();
+    const documentFamilyJobs = await loadDocumentFamilyJobs(job);
+    data.documents = mergeFamilyDocuments(documentFamilyJobs);
     data.returnVisitJobs = returnVisitJobs;
 
     res.json({ success: true, data });
@@ -943,6 +1112,7 @@ router.post(
 
         const meta = await headObject(item.key);
         createdDocs.push({
+          _id: new mongoose.Types.ObjectId(),
           key: item.key,
           fileName: item.fileName,
           contentType: meta.ContentType || 'application/octet-stream',
@@ -953,11 +1123,21 @@ router.post(
         });
       }
 
-      job.documents.push(...createdDocs);
-      await job.save();
-      await job.populate('documents.uploadedBy', 'name email role');
+      const familyJobs = await loadDocumentFamilyJobs(job);
+      for (const familyJob of familyJobs) {
+        const existingKeys = new Set((familyJob.documents || []).map((doc) => String(doc.key || '')));
+        const additions = cloneDocumentEntries(createdDocs).filter((doc) => !existingKeys.has(doc.key));
+        if (!additions.length) continue;
+        familyJob.documents.push(...additions);
+        await familyJob.save();
+      }
 
-      const latest = job.documents.slice(-createdDocs.length);
+      const requestFamilyJob =
+        familyJobs.find((familyJob) => String(familyJob._id) === String(job._id)) || job;
+      await requestFamilyJob.populate('documents.uploadedBy', 'name email role');
+
+      const latestKeys = new Set(createdDocs.map((doc) => doc.key));
+      const latest = (requestFamilyJob.documents || []).filter((doc) => latestKeys.has(doc.key));
       const firstFile = latest[0]?.fileName || 'document';
       const message = latest.length === 1
         ? `${actorWithRole(req.user)} uploaded "${firstFile}" to job "${job.title}"`
@@ -997,7 +1177,9 @@ router.get('/:id/documents/:docId/url', async (req, res) => {
       return res.status(403).json({ success: false, error: 'Not authorized to view documents for this job' });
     }
 
-    const doc = job.documents.id(req.params.docId);
+    const familyJobs = await loadDocumentFamilyJobs(job);
+    const match = findDocumentInFamilyJobs(familyJobs, req.params.docId);
+    const doc = match?.doc;
     if (!doc) return res.status(404).json({ success: false, error: 'Document not found' });
 
     const url = await getDownloadUrl({
@@ -1033,11 +1215,14 @@ router.delete('/:id/documents/:docId', async (req, res) => {
       return res.status(403).json({ success: false, error: 'Not authorized' });
     }
 
-    const doc = job.documents.id(req.params.docId);
+    const familyJobs = await loadDocumentFamilyJobs(job);
+    const match = findDocumentInFamilyJobs(familyJobs, req.params.docId);
+    const doc = match?.doc;
     if (!doc) return res.status(404).json({ success: false, error: 'Document not found' });
 
     // Only the uploader can delete their own documents
-    if (doc.uploadedBy.toString() !== req.user._id.toString()) {
+    const uploadedById = doc.uploadedBy?._id || doc.uploadedBy;
+    if (!uploadedById || uploadedById.toString() !== req.user._id.toString()) {
       return res.status(403).json({ success: false, error: 'You can only delete documents you uploaded' });
     }
 
@@ -1047,9 +1232,17 @@ router.delete('/:id/documents/:docId', async (req, res) => {
     // Delete from S3 (fire-and-forget, doc is removed from DB regardless)
     try { await deleteObject(doc.key); } catch { /* ignore S3 errors */ }
 
-    // Remove from DB
-    job.documents.pull(req.params.docId);
-    await job.save();
+    // Remove from every linked job so parent/return rows stay mirrored
+    for (const familyJob of familyJobs) {
+      const filteredDocs = (familyJob.documents || []).filter(
+        (item) =>
+          String(item._id) !== String(req.params.docId) &&
+          String(item.key || '') !== String(doc.key || '')
+      );
+      if (filteredDocs.length === (familyJob.documents || []).length) continue;
+      familyJob.set('documents', filteredDocs);
+      await familyJob.save();
+    }
 
     // Notify admins/managers + assigned tech
     const recipientIds = [];
@@ -1115,6 +1308,22 @@ router.post(
       if (parent.incompleteReturnRequest?.status === 'PENDING') {
         return res.status(400).json({ success: false, error: 'An Incomplete / Return request is already pending approval.' });
       }
+      if (parent.incompleteReturnRequest?.status === 'APPROVED') {
+        return res.status(400).json({
+          success: false,
+          error: 'This job is no longer open for a new Incomplete / Return request.',
+        });
+      }
+      const existingReturnVisit = await Job.exists({
+        parentJob: parent._id,
+        jobVisitKind: 'RETURN',
+      });
+      if (existingReturnVisit) {
+        return res.status(400).json({
+          success: false,
+          error: 'A linked return visit has already been created for this job.',
+        });
+      }
 
       const reasonType = req.body.reasonType;
       const describeReason = String(req.body.describeReason || '').trim();
@@ -1169,10 +1378,7 @@ router.post(
       });
 
       broadcastJobUpdate();
-      const updated = await Job.findById(parent._id).populate([
-        { path: 'assignedTechnician', select: 'name email' },
-        { path: 'secondaryAssignedTechnician', select: 'name email' },
-      ]);
+      const updated = await withJobDetailPopulate(Job.findById(parent._id));
       res.status(201).json({ success: true, data: updated });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
@@ -1231,9 +1437,7 @@ router.patch(
       const reasonLabel =
         parent.incompleteReturnRequest.reasonType === 'MANUFACTURER' ? 'Manufacturer issue' : 'Our issue';
       const reviewLine =
-        decision === 'APPROVED'
-          ? `Incomplete / Return request approved (${reasonLabel}).`
-          : `Incomplete / Return request rejected (${reasonLabel}).${adminReviewNotes ? ` Notes: ${adminReviewNotes}` : ''}`;
+        `Incomplete / Return request ${decision === 'APPROVED' ? 'approved' : 'rejected'} (${reasonLabel}).${adminReviewNotes ? ` Notes: ${adminReviewNotes}` : ''}`;
       pushStatusHistoryNote(parent, req.user._id, reviewLine);
       await parent.save();
 
@@ -1252,16 +1456,19 @@ router.patch(
         type,
         message: msg,
         jobId: parent._id,
+        meta: {
+          actionLabel: 'Click to view job details.',
+          reviewDecision: decision,
+          reviewedAt: parent.incompleteReturnRequest.reviewedAt,
+          adminReviewNotes: adminReviewNotes || undefined,
+        },
         recipientIds: techRecipients,
         recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,
       });
 
       broadcastJobUpdate();
-      const updated = await Job.findById(parent._id).populate([
-        { path: 'assignedTechnician', select: 'name email' },
-        { path: 'secondaryAssignedTechnician', select: 'name email' },
-      ]);
+      const updated = await withJobDetailPopulate(Job.findById(parent._id));
 
       res.json({
         success: true,
@@ -1293,7 +1500,7 @@ router.post(
     try {
       const parent = await Job.findById(req.params.id)
         .select(
-          '_id title description status customer companyName customerName customerPhone customerEmail address jobType programmingSubtype estimatedCost notes assignedTechnician secondaryAssignedTechnician createdBy parentJob jobVisitKind returnWorkflow incompleteReturnRequest'
+          '_id title description status customer companyName customerName customerPhone customerEmail address jobType programmingSubtype estimatedCost notes assignedTechnician secondaryAssignedTechnician createdBy parentJob jobVisitKind returnWorkflow incompleteReturnRequest statusHistory documents'
         )
         .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
 
@@ -1311,6 +1518,16 @@ router.post(
         }
         return res.status(403).json({ success: false, error: 'Not authorized to create a return visit for this job.' });
       }
+      const existingReturnVisit = await Job.exists({
+        parentJob: parent._id,
+        jobVisitKind: 'RETURN',
+      });
+      if (existingReturnVisit) {
+        return res.status(400).json({
+          success: false,
+          error: 'A linked return visit has already been created for this job.',
+        });
+      }
 
       const normalizedDate = normalizeDateOnly(req.body.scheduledDate);
       const notes = typeof req.body.notes === 'string' ? req.body.notes.trim() : '';
@@ -1318,7 +1535,7 @@ router.post(
         req.body.paymentDiscussionNeeded === undefined ? true : Boolean(req.body.paymentDiscussionNeeded);
 
       const childData = {
-        title: `${parent.title} (Return)`,
+        title: parent.title,
         description: parent.description || '',
         customer: parent.customer,
         companyName: parent.companyName,
@@ -1327,7 +1544,9 @@ router.post(
         customerEmail: parent.customerEmail,
         address: parent.address,
         scheduledDate: normalizedDate,
-        status: JOB_STATUS.TENTATIVE,
+        status: JOB_STATUS.ASSIGNED,
+        assignedTechnician: parent.assignedTechnician || undefined,
+        secondaryAssignedTechnician: parent.secondaryAssignedTechnician || undefined,
         createdBy: req.user._id,
         parentJob: parent._id,
         jobVisitKind: 'RETURN',
@@ -1335,12 +1554,15 @@ router.post(
         programmingSubtype: parent.programmingSubtype,
         estimatedCost: parent.estimatedCost,
         notes: notes || undefined,
+        documents: cloneDocumentEntries(parent.documents),
         statusHistory: [
+          ...cloneStatusHistoryEntries(parent.statusHistory),
           {
             fromStatus: null,
-            toStatus: JOB_STATUS.TENTATIVE,
+            toStatus: JOB_STATUS.ASSIGNED,
             changedBy: req.user._id,
-            notes: 'Return visit scheduled',
+            changedAt: new Date(),
+            notes: 'Return visit scheduled and assigned',
           },
         ],
       };
@@ -1360,14 +1582,6 @@ router.post(
       parent.returnWorkflow.paymentDiscussionNeeded = paymentDiscussionNeeded;
       parent.markModified('returnWorkflow');
 
-      parent.incompleteReturnRequest = {
-        status: 'NONE',
-        describeReason: '',
-        needsManagerContactStatic: false,
-        manufacturer: { partsNeeded: '', rmaStatus: 'WAITING' },
-      };
-      parent.markModified('incompleteReturnRequest');
-
       pushStatusHistoryNote(
         parent,
         req.user._id,
@@ -1384,6 +1598,7 @@ router.post(
         type: 'JOB_RETURN_VISIT_CREATED',
         message: `${actorWithRole(req.user)} scheduled a return visit for "${parent.title}" on ${normalizedDate}.${payHint}`,
         jobId: parent._id,
+        meta: notes ? { note: notes } : undefined,
         recipientIds: techRecipients,
         recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,
@@ -1647,10 +1862,13 @@ router.patch(
         notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
       }
 
+      const notificationNotes = typeof req.body.notes === 'string' ? req.body.notes.trim() : '';
+
       createNotification({
         type: `JOB_${req.body.status === 'IN_PROGRESS' ? 'STARTED' : req.body.status}`,
         message: `${STATUS_MESSAGES[req.body.status] || `Job "${job.title}" status updated`} by ${actorWithRole(req.user)}`,
         jobId: job._id,
+        meta: notificationNotes ? { note: notificationNotes } : undefined,
         recipientIds: notifRecipientIds,
         recipientRoles: notifRoles,
         excludeUserId: req.user._id,
@@ -1701,6 +1919,7 @@ router.patch(
 
       // Notify the assigned technician immediately when assigned
       const assignedJob = result.data;
+      const assignmentNote = typeof req.body.notes === 'string' ? req.body.notes.trim() : '';
       createNotification({
         type: 'JOB_ASSIGNED',
         message: `Job "${assignedJob.title}" has been assigned to you by ${actorWithRole(req.user)}. Instructions: ${req.body.notes}`,
@@ -1722,6 +1941,7 @@ router.patch(
         type: 'JOB_ASSIGNED',
         message: `Job "${assignedJob.title}" has been assigned to ${assignedJob.assignedTechnician?.name || 'a technician'}${assignedJob.secondaryAssignedTechnician?.name ? ` and ${assignedJob.secondaryAssignedTechnician.name}` : ''} by ${actorWithRole(req.user)}`,
         jobId: assignedJob._id,
+        meta: assignmentNote ? { note: assignmentNote } : undefined,
         recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,
       });
@@ -1800,6 +2020,7 @@ router.patch(
         });
       }
       await job.save();
+      await syncAssignmentRequirementsToFamily(job, merged).catch(() => {});
       await job.populate('documents.uploadedBy', 'name email role');
       broadcastJobUpdate();
       return res.json({ success: true, data: job, message: 'Assignment document requirements updated' });
@@ -1825,7 +2046,9 @@ router.post(
       return res.status(400).json({ success: false, errors: errors.array() });
     }
     try {
-      const job = await Job.findById(req.params.id).select('_id assignmentDocumentRequirements');
+      const job = await Job.findById(req.params.id).select(
+        '_id assignmentDocumentRequirements parentJob jobType programmingSubtype'
+      );
       if (!job) {
         return res.status(404).json({ success: false, error: 'Job not found' });
       }
@@ -1833,9 +2056,29 @@ router.post(
         return res.status(403).json({ success: false, error: 'Not authorized to update this job' });
       }
 
-      const requirement = (job.assignmentDocumentRequirements || []).find(
+      let requirement = (job.assignmentDocumentRequirements || []).find(
         (row) => row?.key === req.body.requirementKey
       );
+      if (!requirement && job.parentJob) {
+        const parentId = job.parentJob?._id || job.parentJob;
+        const parentDoc = await Job.findById(parentId).select('assignmentDocumentRequirements').lean();
+        requirement = (parentDoc?.assignmentDocumentRequirements || []).find(
+          (row) => row?.key === req.body.requirementKey
+        );
+        if (requirement) {
+          job.assignmentDocumentRequirements = parentDoc.assignmentDocumentRequirements;
+          await job.save();
+        }
+      }
+      if (!requirement) {
+        // Lazily resolve requirements from the job type (e.g. job is still in TENTATIVE with empty DB requirements)
+        const resolved = await resolveAssignmentRequirementsForJob(job);
+        requirement = resolved.find((row) => row?.key === req.body.requirementKey);
+        if (requirement) {
+          job.assignmentDocumentRequirements = resolved;
+          await job.save();
+        }
+      }
       if (!requirement) {
         return res.status(400).json({ success: false, error: 'Invalid requirement key' });
       }
@@ -1895,9 +2138,16 @@ router.post(
         return res.status(403).json({ success: false, error: 'Not authorized to update this job' });
       }
 
-      const rows = Array.isArray(job.assignmentDocumentRequirements)
+      let rows = Array.isArray(job.assignmentDocumentRequirements)
         ? [...job.assignmentDocumentRequirements]
         : [];
+      if (rows.length === 0) {
+        const resolved = await resolveAssignmentRequirementsForJob(job);
+        if (resolved.length > 0) {
+          job.assignmentDocumentRequirements = resolved;
+          rows = resolved;
+        }
+      }
       const rowIndex = rows.findIndex((row) => row?.key === req.body.requirementKey);
       if (rowIndex === -1) {
         return res.status(400).json({ success: false, error: 'Invalid requirement key' });
@@ -1927,6 +2177,7 @@ router.post(
         notes: `${changedFieldName} is ${previousKey ? 'updated' : 'uploaded'} by ${actorWithRole(req.user)}.`,
       });
       await job.save();
+      await syncAssignmentRequirementsToFamily(job, rows).catch(() => {});
 
       if (previousKey && previousKey !== req.body.key) {
         await deleteObject(previousKey).catch(() => { });
@@ -1957,15 +2208,22 @@ router.get(
   async (req, res) => {
     try {
       const job = await Job.findById(req.params.id).select(
-        '_id status assignedTechnician secondaryAssignedTechnician assignmentDocumentRequirements'
+        '_id status assignedTechnician secondaryAssignedTechnician assignmentDocumentRequirements parentJob'
       );
       if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
       if (!canAccessJob(req.user, job)) {
         return res.status(403).json({ success: false, error: 'Not authorized to view this job' });
       }
-      const row = (job.assignmentDocumentRequirements || []).find(
+      let row = (job.assignmentDocumentRequirements || []).find(
         (item) => item?.key === req.params.requirementKey
       );
+      if (!row?.document?.key && job.parentJob) {
+        const parentId = job.parentJob?._id || job.parentJob;
+        const parentDoc = await Job.findById(parentId).select('assignmentDocumentRequirements').lean();
+        row = (parentDoc?.assignmentDocumentRequirements || []).find(
+          (item) => item?.key === req.params.requirementKey
+        );
+      }
       if (!row?.document?.key) {
         return res.status(404).json({ success: false, error: 'Document not found' });
       }
@@ -2015,6 +2273,7 @@ router.delete(
         notes: `${changedFieldName} is deleted by ${actorWithRole(req.user)}.`,
       });
       await job.save();
+      await syncAssignmentRequirementsToFamily(job, rows).catch(() => {});
       if (oldKey) {
         await deleteObject(oldKey).catch(() => { });
       }
@@ -2311,6 +2570,14 @@ router.patch(
         });
       }
       await job.save();
+      const clRootId = job.parentJob?._id || job.parentJob || job._id;
+      const clFamilyJobs = await Job.find({
+        $or: [{ _id: clRootId }, { parentJob: clRootId, jobVisitKind: 'RETURN' }],
+      }).select('_id');
+      const clOtherIds = clFamilyJobs.map((j) => j._id).filter((id) => String(id) !== String(job._id));
+      if (clOtherIds.length > 0) {
+        await Job.updateMany({ _id: { $in: clOtherIds } }, { $set: { assignmentChecklist: nextChecklist } }).catch(() => {});
+      }
       await job.populate('assignedTechnician', 'name email certificates');
       await job.populate('secondaryAssignedTechnician', 'name email certificates');
       await job.populate('createdBy', 'name email');
@@ -2556,11 +2823,25 @@ router.put(
 router.get('/:id/history', async (req, res) => {
   try {
     const job = await Job.findById(req.params.id)
-      .select('statusHistory status title')
+      .select('statusHistory status title assignedTechnician secondaryAssignedTechnician parentJob jobVisitKind')
+      .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician')
       .populate('statusHistory.changedBy', 'name email role')
       .populate('statusHistory.technician', 'name email');
 
     if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+    if (!canAccessJob(req.user, job)) {
+      return res.status(403).json({ success: false, error: 'Not authorized to view this job history' });
+    }
+
+    let history = Array.isArray(job.statusHistory) ? job.statusHistory : [];
+    if (job.parentJob) {
+      const parentId = job.parentJob._id || job.parentJob;
+      const parent = await Job.findById(parentId)
+        .select('statusHistory')
+        .populate('statusHistory.changedBy', 'name email role')
+        .populate('statusHistory.technician', 'name email');
+      history = mergeStatusHistoryEntries(parent?.statusHistory, job.statusHistory);
+    }
 
     res.json({
       success: true,
@@ -2568,7 +2849,7 @@ router.get('/:id/history', async (req, res) => {
         jobId: job._id,
         title: job.title,
         currentStatus: job.status,
-        history: job.statusHistory,
+        history,
       },
     });
   } catch (error) {

@@ -276,9 +276,19 @@ router.get(
           .lean(),
       ]);
 
+      const rootIds = jobs.filter((job) => !job.parentJob).map((job) => job._id);
+      const parentIds = rootIds.length > 0
+        ? await Job.find({ parentJob: { $in: rootIds }, jobVisitKind: 'RETURN' }).distinct('parentJob')
+        : [];
+      const parentIdSet = new Set(parentIds.map((id) => String(id)));
+      const jobsWithLinkedReturnFlag = jobs.map((job) => ({
+        ...job,
+        hasLinkedReturnVisit: !job.parentJob && parentIdSet.has(String(job._id)),
+      }));
+
       res.json({
         success: true,
-        data: { technician: tech, timeouts, jobs },
+        data: { technician: tech, timeouts, jobs: jobsWithLinkedReturnFlag },
       });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
