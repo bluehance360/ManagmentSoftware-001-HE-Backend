@@ -4,6 +4,7 @@ const http = require('http');
 const cors = require('cors');
 const connectDB = require('./config/db');
 const { initSocket } = require('./socket');
+const notificationScheduler = require('./services/SchedulerService');
 const authRoutes = require('./routes/auth');
 const jobRoutes = require('./routes/jobs');
 const userRoutes = require('./routes/users');
@@ -20,6 +21,8 @@ const server = http.createServer(app);
 connectDB();
 
 initSocket(server);
+
+notificationScheduler.start();
 
 // CORS Configuration
 const corsOptions = {
