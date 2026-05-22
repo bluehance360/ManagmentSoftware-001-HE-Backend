@@ -4,6 +4,7 @@ const http = require('http');
 const cors = require('cors');
 const connectDB = require('./config/db');
 const { initSocket } = require('./socket');
+const notificationScheduler = require('./services/SchedulerService');
 const authRoutes = require('./routes/auth');
 const jobRoutes = require('./routes/jobs');
 const userRoutes = require('./routes/users');
@@ -11,6 +12,7 @@ const notificationRoutes = require('./routes/notifications');
 const invitationRoutes = require('./routes/invitations');
 const customerRoutes = require('./routes/customers');
 const techTimeoutRoutes = require('./routes/techTimeouts');
+const fsrDocsRoutes = require('./routes/fsrDocs');
 const { errorHandler, notFound } = require('./middleware/errorHandler');
 
 const app = express();
@@ -20,6 +22,8 @@ const server = http.createServer(app);
 connectDB();
 
 initSocket(server);
+
+notificationScheduler.start();
 
 // CORS Configuration
 const corsOptions = {
@@ -41,12 +45,13 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/invitations', invitationRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/tech-timeouts', techTimeoutRoutes);
+app.use('/api/fsr-docs', fsrDocsRoutes);
 
 // Error handling
 app.use(notFound);
 app.use(errorHandler);
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5001;
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);

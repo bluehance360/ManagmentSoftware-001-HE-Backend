@@ -10,11 +10,22 @@ const { sendPushToUsers } = require('./PushService');
  * @param {string} opts.type - notification type
  * @param {string} opts.message - human-readable message
  * @param {string} opts.jobId - related job id
+ * @param {Object} [opts.meta] - additional metadata for notification actions
  * @param {string[]} [opts.recipientIds] - explicit recipient user ids
  * @param {string[]} [opts.recipientRoles] - send to all users with these roles
  * @param {string} [opts.excludeUserId] - exclude this user (the actor)
+ * @param {string} [opts.dedupeKey] - optional idempotency key per recipient
  */
-async function createNotification({ type, message, jobId, recipientIds, recipientRoles, excludeUserId }) {
+async function createNotification({
+  type,
+  message,
+  jobId,
+  meta,
+  recipientIds,
+  recipientRoles,
+  excludeUserId,
+  dedupeKey,
+}) {
   try {
     let recipients = [];
 
@@ -40,33 +51,77 @@ async function createNotification({ type, message, jobId, recipientIds, recipien
 
     if (recipients.length === 0) return;
 
-    const docs = recipients.map((recipientId) => ({
-      recipient: recipientId,
-      type,
-      message,
-      job: jobId,
-    }));
+    let notifiedRecipients = recipients;
 
-    await Notification.insertMany(docs);
+    if (dedupeKey) {
+      const operations = recipients.map((recipientId) => ({
+        updateOne: {
+          filter: { recipient: recipientId, dedupeKey },
+          update: {
+            $setOnInsert: {
+              recipient: recipientId,
+              type,
+              message,
+              job: jobId,
+              meta,
+              dedupeKey,
+              read: false,
+            },
+          },
+          upsert: true,
+        },
+      }));
+
+      const result = await Notification.bulkWrite(operations, { ordered: false });
+      const insertedIndexes = Object.keys(result.upsertedIds || {}).map((key) => Number(key));
+      notifiedRecipients = insertedIndexes.map((index) => recipients[index]).filter(Boolean);
+    } else {
+      const docs = recipients.map((recipientId) => ({
+        recipient: recipientId,
+        type,
+        message,
+        job: jobId,
+        meta,
+      }));
+
+      await Notification.insertMany(docs);
+    }
+
+    if (notifiedRecipients.length === 0) return;
 
     // Emit real-time socket event to recipients
     emitToUsers({
       event: 'notification',
-      data: { type, message, jobId },
-      recipientIds: recipients,
+      data: { type, message, jobId, meta },
+      recipientIds: notifiedRecipients,
       excludeUserId,
     });
 
+    const timeoutRouteTypes = new Set([
+      'TECH_TIMEOUT',
+      'TECH_TIMEOUT_REQUESTED',
+      'TECH_TIMEOUT_APPROVED',
+      'TECH_TIMEOUT_REJECTED',
+      'TECH_TIMEOUT_CANCELLED',
+    ]);
+
     // Send Web Push to offline users (fire-and-forget)
-    sendPushToUsers(recipients, {
+    sendPushToUsers(notifiedRecipients, {
       title: 'Hosanna Electric',
       body: message,
       icon: '/Hosanna-logo.webp',
       badge: '/Hosanna-logo.webp',
       data: {
-        url: jobId ? '/jobs' : type === 'TEAM_MEMBER_JOINED' ? '/team' : type === 'TECH_TIMEOUT' ? '/timeout' : '/dashboard',
+        url: jobId
+          ? `/jobs?openJob=${jobId}`
+          : type === 'TEAM_MEMBER_JOINED'
+            ? '/team'
+            : timeoutRouteTypes.has(type)
+              ? '/timeout'
+              : '/dashboard',
         jobId,
         type,
+        meta,
       },
     }).catch(() => {}); // non-blocking
   } catch (error) {

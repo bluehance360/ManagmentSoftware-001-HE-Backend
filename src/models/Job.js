@@ -32,6 +32,11 @@ const statusHistorySchema = new mongoose.Schema(
       ref: 'User',
       default: null,
     },
+    assignmentChecklist: {
+      firstPageReceived: { type: Boolean, default: false },
+      printsDrawingsReceived: { type: Boolean, default: false },
+      siteContactInfoReceived: { type: Boolean, default: false },
+    },
   },
   { _id: true }
 );
@@ -74,6 +79,93 @@ const documentSchema = new mongoose.Schema(
     },
   },
   { _id: true }
+);
+
+const assignmentDocumentRequirementSchema = new mongoose.Schema(
+  {
+    key: { type: String, required: true, trim: true },
+    label: { type: String, required: true, trim: true },
+    checked: { type: Boolean, default: false },
+    textValue: { type: String, trim: true, default: '' },
+    document: {
+      key: { type: String, trim: true },
+      fileName: { type: String, trim: true },
+      contentType: { type: String, trim: true, default: 'application/octet-stream' },
+      size: { type: Number, min: 0, default: 0 },
+      uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+      uploadedAt: { type: Date },
+    },
+  },
+  { _id: false }
+);
+
+const RETURN_WORKFLOW_REASONS = ['NONE', 'RETURN_VISIT', 'MANUFACTURER', 'OUR_ISSUE'];
+const RMA_STATUSES = ['ORDERED', 'WAITING', 'RECEIVED'];
+const OUR_ISSUE_REVIEW_STATUSES = ['NONE', 'PENDING', 'APPROVED', 'REJECTED'];
+const JOB_VISIT_KINDS = ['STANDARD', 'RETURN'];
+
+/** Technician submits → admin approves → admin schedules return child job. */
+const incompleteReturnRequestSchema = new mongoose.Schema(
+  {
+    status: {
+      type: String,
+      enum: ['NONE', 'PENDING', 'APPROVED', 'REJECTED'],
+      default: 'NONE',
+    },
+    reasonType: {
+      type: String,
+      enum: ['MANUFACTURER', 'OUR_ISSUE'],
+    },
+    manufacturer: {
+      partsNeeded: { type: String, trim: true, default: '' },
+      rmaStatus: {
+        type: String,
+        enum: RMA_STATUSES,
+        default: 'WAITING',
+      },
+    },
+    describeReason: { type: String, trim: true, default: '' },
+    /** UI-only for now (no server-side behavior). */
+    needsManagerContactStatic: { type: Boolean, default: false },
+    submittedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    submittedAt: { type: Date },
+    reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    reviewedAt: { type: Date },
+    adminReviewNotes: { type: String, trim: true, default: '' },
+  },
+  { _id: false }
+);
+
+const returnWorkflowSchema = new mongoose.Schema(
+  {
+    reason: {
+      type: String,
+      enum: RETURN_WORKFLOW_REASONS,
+      default: 'NONE',
+    },
+    manufacturer: {
+      partsNeeded: { type: String, trim: true, default: '' },
+      rmaStatus: {
+        type: String,
+        enum: RMA_STATUSES,
+        default: 'WAITING',
+      },
+    },
+    ourIssue: {
+      techRequestedAdminContact: { type: Boolean, default: false },
+      reviewStatus: {
+        type: String,
+        enum: OUR_ISSUE_REVIEW_STATUSES,
+        default: 'NONE',
+      },
+      reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      reviewedAt: { type: Date, default: null },
+      reviewNotes: { type: String, trim: true, default: '' },
+    },
+    returnNotes: { type: String, trim: true, default: '' },
+    paymentDiscussionNeeded: { type: Boolean, default: true },
+  },
+  { _id: false }
 );
 
 const jobSchema = new mongoose.Schema(
@@ -125,6 +217,11 @@ const jobSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
     },
+    secondaryAssignedTechnician: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
@@ -140,6 +237,20 @@ const jobSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
+    programmingSubtype: {
+      type: String,
+      enum: ['New Start-Up', 'Existing Start-Up'],
+      trim: true,
+    },
+    assignmentChecklist: {
+      firstPageReceived: { type: Boolean, default: false },
+      printsDrawingsReceived: { type: Boolean, default: false },
+      siteContactInfoReceived: { type: Boolean, default: false },
+    },
+    assignmentDocumentRequirements: {
+      type: [assignmentDocumentRequirementSchema],
+      default: [],
+    },
     actualCost: {
       type: Number,
       min: 0,
@@ -154,6 +265,27 @@ const jobSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
+    /** Parent job when this row is a return visit (child). */
+    parentJob: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Job',
+      default: null,
+    },
+    /** STANDARD job vs RETURN visit row (child linked to parentJob). */
+    jobVisitKind: {
+      type: String,
+      enum: JOB_VISIT_KINDS,
+      default: 'STANDARD',
+    },
+    /** Incomplete-job / return / manufacturer / our-issue context (stored on the root job, not the return child). */
+    returnWorkflow: {
+      type: returnWorkflowSchema,
+      default: () => ({}),
+    },
+    incompleteReturnRequest: {
+      type: incompleteReturnRequestSchema,
+      default: undefined,
+    },
   },
   {
     timestamps: true,
@@ -165,5 +297,7 @@ jobSchema.index({ status: 1, assignedTechnician: 1 });
 jobSchema.index({ createdAt: -1 });
 jobSchema.index({ scheduledDate: 1 });
 jobSchema.index({ jobType: 1 });
+jobSchema.index({ parentJob: 1 });
+jobSchema.index({ jobVisitKind: 1 });
 
 module.exports = mongoose.model('Job', jobSchema);

@@ -23,6 +23,11 @@ const customerSchema = new mongoose.Schema(
       trim: true,
       default: '',
     },
+    /** When true, assigning a tech requires "First page received" on the assignment checklist. */
+    firstPageRequired: {
+      type: Boolean,
+      default: false,
+    },
   },
   { timestamps: true }
 );

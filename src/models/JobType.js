@@ -15,6 +15,42 @@ const jobTypeSchema = new mongoose.Schema(
       lowercase: true,
       unique: true,
     },
+    certificationRequired: {
+      type: Boolean,
+      default: false,
+    },
+    /** When true, jobs of this type require programmingSubtype (New / Existing Start-Up). */
+    isProgramming: {
+      type: Boolean,
+      default: false,
+    },
+    /** Labels shown in assign flow; future enforcement will use these keys/labels. */
+    documentRequirements: {
+      type: [
+        {
+          label: { type: String, required: true, trim: true, maxlength: 200 },
+        },
+      ],
+      default: [],
+    },
+    programmingDocumentRequirements: {
+      newStartup: {
+        type: [
+          {
+            label: { type: String, required: true, trim: true, maxlength: 200 },
+          },
+        ],
+        default: [],
+      },
+      existingStartup: {
+        type: [
+          {
+            label: { type: String, required: true, trim: true, maxlength: 200 },
+          },
+        ],
+        default: [],
+      },
+    },
   },
   { timestamps: false }
 );

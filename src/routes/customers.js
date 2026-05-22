@@ -17,7 +17,7 @@ router.get(
     try {
       const customers = await Customer.find()
         .sort({ name: 1 })
-        .select('name phone email address');
+        .select('name phone email address firstPageRequired');
       res.json({ success: true, data: customers });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
@@ -46,7 +46,16 @@ router.get(
         .populate('assignedTechnician', 'name email')
         .populate('createdBy', 'name email')
         .sort({ createdAt: -1 })
-        .select('title status scheduledDate assignedTechnician createdBy companyName createdAt');
+        .select('title status scheduledDate assignedTechnician createdBy companyName createdAt parentJob jobVisitKind');
+
+      const rootIds = jobs.filter((job) => !job.parentJob).map((job) => job._id);
+      const parentIds = rootIds.length > 0
+        ? await Job.find({ parentJob: { $in: rootIds }, jobVisitKind: 'RETURN' }).distinct('parentJob')
+        : [];
+      const parentIdSet = new Set(parentIds.map((id) => String(id)));
+      jobs.forEach((job) => {
+        job.set('hasLinkedReturnVisit', !job.parentJob && parentIdSet.has(String(job._id)), { strict: false });
+      });
 
       res.json({ success: true, data: { customer, jobs } });
     } catch (error) {
@@ -95,6 +104,7 @@ router.put(
     body('phone').optional().trim(),
     body('email').optional({ checkFalsy: true }).isEmail().withMessage('Invalid email').normalizeEmail(),
     body('address').optional().trim(),
+    body('firstPageRequired').optional().isBoolean().withMessage('firstPageRequired must be true or false'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
