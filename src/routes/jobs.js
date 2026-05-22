@@ -6,6 +6,7 @@ const JobType = require('../models/JobType');
 const JobTypeSettings = require('../models/JobTypeSettings');
 const User = require('../models/User');
 const FsrDocument = require('../models/FsrDocument');
+const FsrSignatureRequest = require('../models/FsrSignatureRequest');
 const { authenticate, authorize } = require('../middleware/auth');
 const { ROLES, JOB_STATUS } = require('../config/constants');
 const JobService = require('../services/JobService');
@@ -13,6 +14,7 @@ const Customer = require('../models/Customer');
 const TechTimeout = require('../models/TechTimeout');
 const { createNotification } = require('../services/NotificationService');
 const { getIO } = require('../socket');
+const { sendFsrSignatureRequestEmail } = require('../services/EmailService');
 const { normalizeDateOnly, isDateOnly, toLocalDateOnly } = require('../utils/dateOnly');
 const {
   buildDocumentKey,
@@ -35,6 +37,19 @@ const {
   formatFsrDocument,
   resolveFsrTemplateForJobType,
 } = require('../services/FsrService');
+const {
+  FSR_SIGNATURE_REQUEST_STATUS,
+  getSignatureRequestDefinition,
+  sanitizeSignatureRequestContext,
+  buildSignatureRequestNextSendAllowedAt,
+  buildSignatureRequestSummary,
+  normalizeDraftSignaturesObject,
+  getDraftSignatureValue,
+  getLatestSignatureRequestsByField,
+  getPendingSignatureRequest,
+  cancelPendingSignatureRequest,
+  cancelPendingSignatureRequestsForFsr,
+} = require('../services/FsrSignatureRequestService');
 
 const router = express.Router();
 
@@ -221,6 +236,29 @@ function ensureSignatureDataUrl(value, fieldLabel, required = false) {
   return normalized;
 }
 
+function ensureRequiredEmail(value, fieldLabel) {
+  const normalized = ensureOptionalEmail(value, fieldLabel);
+  if (!normalized) {
+    throwBadRequest(`${fieldLabel} is required`);
+  }
+  return normalized;
+}
+
+function resolveSubmittedOrDraftSignature(fsrDoc, payloadValue, signatureFieldKey, fieldLabel, required = false) {
+  const submittedValue = ensureSignatureDataUrl(payloadValue, fieldLabel, false);
+  if (submittedValue) return submittedValue;
+  const draftValue = ensureSignatureDataUrl(
+    getDraftSignatureValue(fsrDoc, signatureFieldKey),
+    fieldLabel,
+    false
+  );
+  if (draftValue) return draftValue;
+  if (required) {
+    throwBadRequest(`${fieldLabel} is required`);
+  }
+  return '';
+}
+
 async function normalizeFsrAssets(rawAssets, jobId, userId, maxCount = FSR_MAX_ASSETS) {
   if (rawAssets === undefined) return [];
   if (!Array.isArray(rawAssets)) {
@@ -286,10 +324,12 @@ async function buildSubmissionPayloadForFsr({ fsrDoc, submissionData, job, userI
           ? {
               traineeName: trimString(payload.training?.traineeName),
               traineeCompany: trimString(payload.training?.traineeCompany),
-              traineeSignature: ensureSignatureDataUrl(
+              traineeSignature: resolveSubmittedOrDraftSignature(
+                fsrDoc,
                 payload.training?.traineeSignature,
+                'standard.training.traineeSignature',
                 'Trainee Signature',
-                false
+                true
               ),
             }
           : null,
@@ -300,8 +340,10 @@ async function buildSubmissionPayloadForFsr({ fsrDoc, submissionData, job, userI
             payload.clientAcceptance?.acceptorCompany,
             'Acceptor Company'
           ),
-          acceptorSignature: ensureSignatureDataUrl(
+          acceptorSignature: resolveSubmittedOrDraftSignature(
+            fsrDoc,
             payload.clientAcceptance?.acceptorSignature,
+            'standard.clientAcceptance.acceptorSignature',
             'Acceptor Signature',
             true
           ),
@@ -346,10 +388,12 @@ async function buildSubmissionPayloadForFsr({ fsrDoc, submissionData, job, userI
               ),
               traineeName: trimString(payload.training?.traineeName),
               traineeCompany: trimString(payload.training?.traineeCompany),
-              traineeSignature: ensureSignatureDataUrl(
+              traineeSignature: resolveSubmittedOrDraftSignature(
+                fsrDoc,
                 payload.training?.traineeSignature,
+                'wattstopper.training.traineeSignature',
                 'Trainee Signature',
-                false
+                true
               ),
             }
           : null,
@@ -371,9 +415,11 @@ async function buildSubmissionPayloadForFsr({ fsrDoc, submissionData, job, userI
             payload.reportReceivedBy?.company,
             'Report Received By Company'
           ),
-          signature: ensureSignatureDataUrl(
+          signature: resolveSubmittedOrDraftSignature(
+            fsrDoc,
             payload.reportReceivedBy?.signature,
-            'Report Received By Signature',
+            'wattstopper.reportReceivedBy.signature',
+            'Signature',
             true
           ),
         },
@@ -451,6 +497,8 @@ async function attachAssetUrlsToFsrData(data) {
 
 async function buildFsrResponseData(job, fsrDoc) {
   const data = await attachAssetUrlsToFsrData(formatFsrDocument(fsrDoc));
+  data.draftSignatures = normalizeDraftSignaturesObject(data.draftSignatures);
+  data.signatureRequests = await getLatestSignatureRequestsByField(fsrDoc?._id);
   data.job = {
     _id: job._id,
     title: job.title,
@@ -662,6 +710,17 @@ function canUserOpenVisibleFsr(user, job, fsrDoc) {
   if ([ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(user.role)) return true;
   if (user.role !== ROLES.TECHNICIAN) return false;
   return canAccessJob(user, job) && Boolean(fsrDoc.technicianVisible);
+}
+
+function buildSignatureRequestJobSnapshot(job, fsrDoc) {
+  const snapshot = buildJobSnapshot(job);
+  return {
+    projectName: snapshot.projectName || String(job?.title || '').trim(),
+    siteAddress: snapshot.siteAddress || '',
+    companyName: snapshot.companyName || String(job?.companyName || '').trim(),
+    customerName: snapshot.customerName || String(job?.customer?.name || job?.customerName || '').trim(),
+    templateKey: fsrDoc?.templateKey || '',
+  };
 }
 
 function notifyAssignmentDocumentChange({ job, documentFieldName, action, actorUser }) {
@@ -1411,6 +1470,204 @@ router.get('/:id/fsr', async (req, res) => {
   }
 });
 
+// ── POST /api/jobs/:id/fsr/signature-requests ──────────────────────
+router.post(
+  '/:id/fsr/signature-requests',
+  [
+    body('signatureFieldKey').isString().notEmpty().withMessage('signatureFieldKey is required'),
+    body('recipientEmail').isEmail().withMessage('A valid recipientEmail is required'),
+    body('fieldContext').optional().isObject().withMessage('fieldContext must be an object'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const job = await Job.findById(req.params.id)
+        .select(
+          '_id title address customer customerName companyName assignedTechnician secondaryAssignedTechnician status parentJob jobVisitKind'
+        )
+        .populate('customer', 'name address')
+        .populate('assignedTechnician', 'name email')
+        .populate('secondaryAssignedTechnician', 'name email')
+        .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
+
+      if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (!canAccessJob(req.user, job)) {
+        return res.status(403).json({ success: false, error: 'Not authorized to request this signature' });
+      }
+
+      const fsrDoc = await getFsrDocumentByJobId(job._id);
+      if (!fsrDoc) {
+        return res.status(404).json({ success: false, error: 'No FSR document is attached to this job' });
+      }
+      if (!canUserOpenVisibleFsr(req.user, job, fsrDoc)) {
+        return res.status(403).json({
+          success: false,
+          error: 'This FSR will become available after you start the completion flow from Mark Completed.',
+        });
+      }
+      if (fsrDoc.status === FSR_STATUS.SUBMITTED) {
+        return res.status(400).json({ success: false, error: 'Submitted FSRs are read-only' });
+      }
+
+      const signatureFieldKey = trimString(req.body.signatureFieldKey);
+      const definition = getSignatureRequestDefinition(fsrDoc.templateKey, signatureFieldKey);
+      if (!definition) {
+        return res.status(400).json({ success: false, error: 'This signature field cannot be requested by email' });
+      }
+
+      const fieldContext = sanitizeSignatureRequestContext(signatureFieldKey, req.body.fieldContext);
+      const recipientEmail = ensureRequiredEmail(req.body.recipientEmail, 'Recipient email');
+      const now = new Date();
+      const activeRequest = await getPendingSignatureRequest(fsrDoc._id, signatureFieldKey);
+
+      if (
+        activeRequest &&
+        activeRequest.status === FSR_SIGNATURE_REQUEST_STATUS.PENDING &&
+        activeRequest.nextSendAllowedAt &&
+        activeRequest.nextSendAllowedAt > now
+      ) {
+        return res.status(429).json({
+          success: false,
+          error: 'Please wait before resending this signature request.',
+          data: {
+            nextSendAllowedAt: activeRequest.nextSendAllowedAt,
+            sendCount: activeRequest.sendCount,
+          },
+        });
+      }
+
+      const nextSendCount =
+        activeRequest && activeRequest.status === FSR_SIGNATURE_REQUEST_STATUS.PENDING
+          ? Number(activeRequest.sendCount || 1) + 1
+          : 1;
+
+      if (activeRequest && activeRequest.status === FSR_SIGNATURE_REQUEST_STATUS.PENDING) {
+        activeRequest.status = FSR_SIGNATURE_REQUEST_STATUS.REPLACED;
+        await activeRequest.save();
+      }
+
+      const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+      const requestDoc = await FsrSignatureRequest.create({
+        fsrDocument: fsrDoc._id,
+        job: job._id,
+        templateKey: fsrDoc.templateKey,
+        signatureFieldKey,
+        signatureFieldLabel: definition.label,
+        recipientEmail,
+        token: FsrSignatureRequest.generateToken(),
+        status: FSR_SIGNATURE_REQUEST_STATUS.PENDING,
+        requestedBy: req.user._id,
+        requestedByName: req.user.name,
+        requestedAt: now,
+        expiresAt,
+        sendCount: nextSendCount,
+        lastSentAt: now,
+        nextSendAllowedAt: buildSignatureRequestNextSendAllowedAt(nextSendCount, now),
+        fieldContext: {
+          ...fieldContext,
+          sectionLabel: definition.sectionLabel,
+        },
+        jobSnapshot: buildSignatureRequestJobSnapshot(job, fsrDoc),
+      });
+
+      await sendFsrSignatureRequestEmail({
+        to: recipientEmail,
+        token: requestDoc.token,
+        signatureFieldLabel: definition.label,
+        signatureSectionLabel: definition.sectionLabel,
+        requestedByName: req.user.name,
+        requestedByRole: req.user.role,
+        jobTitle: requestDoc.jobSnapshot?.projectName || job.title || 'Untitled job',
+        siteAddress: requestDoc.jobSnapshot?.siteAddress || '',
+        companyName: requestDoc.jobSnapshot?.companyName || '',
+        customerName: requestDoc.jobSnapshot?.customerName || '',
+        expiresAt,
+      });
+
+      createNotification({
+        type: 'JOB_FSR_SIGNATURE_REQUESTED',
+        message: `${actorWithRole(req.user)} requested ${definition.label} by email for job "${job.title}".`,
+        jobId: job._id,
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        excludeUserId: req.user._id,
+      });
+
+      broadcastJobUpdate();
+      return res.json({
+        success: true,
+        message:
+          nextSendCount > 1 ? 'Signature request resent successfully' : 'Signature request sent successfully',
+        data: await buildFsrResponseData(job, fsrDoc),
+        meta: {
+          request: buildSignatureRequestSummary(requestDoc),
+        },
+      });
+    } catch (error) {
+      return res.status(error.status || 500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── POST /api/jobs/:id/fsr/signature-requests/cancel ───────────────
+router.post(
+  '/:id/fsr/signature-requests/cancel',
+  [body('signatureFieldKey').isString().notEmpty().withMessage('signatureFieldKey is required')],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const job = await Job.findById(req.params.id)
+        .select(
+          '_id title address customer customerName companyName assignedTechnician secondaryAssignedTechnician status parentJob jobVisitKind'
+        )
+        .populate('customer', 'name address')
+        .populate('assignedTechnician', 'name email')
+        .populate('secondaryAssignedTechnician', 'name email')
+        .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
+
+      if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (!canAccessJob(req.user, job)) {
+        return res.status(403).json({ success: false, error: 'Not authorized to update this FSR' });
+      }
+
+      const fsrDoc = await getFsrDocumentByJobId(job._id);
+      if (!fsrDoc) {
+        return res.status(404).json({ success: false, error: 'No FSR document is attached to this job' });
+      }
+      if (!canUserOpenVisibleFsr(req.user, job, fsrDoc)) {
+        return res.status(403).json({
+          success: false,
+          error: 'This FSR will become available after you start the completion flow from Mark Completed.',
+        });
+      }
+      if (fsrDoc.status === FSR_STATUS.SUBMITTED) {
+        return res.status(400).json({ success: false, error: 'Submitted FSRs are read-only' });
+      }
+
+      const cancelled = await cancelPendingSignatureRequest(
+        fsrDoc._id,
+        trimString(req.body.signatureFieldKey),
+        FSR_SIGNATURE_REQUEST_STATUS.CANCELLED
+      );
+
+      return res.json({
+        success: true,
+        data: await buildFsrResponseData(job, fsrDoc),
+        meta: { cancelled: Boolean(cancelled) },
+      });
+    } catch (error) {
+      return res.status(error.status || 500).json({ success: false, error: error.message });
+    }
+  }
+);
+
 // ── POST /api/jobs/:id/fsr/open ─────────────────────────────────────
 router.post('/:id/fsr/open', async (req, res) => {
   try {
@@ -1616,6 +1873,7 @@ router.patch(
       fsrDoc.status = FSR_STATUS.NOT_STARTED;
       fsrDoc.jobSnapshot = undefined;
       fsrDoc.submissionData = undefined;
+      fsrDoc.draftSignatures = {};
       fsrDoc.assets = [];
       fsrDoc.submittedBy = null;
       fsrDoc.submittedAt = null;
@@ -1625,6 +1883,10 @@ router.patch(
           : '';
 
       await fsrDoc.save();
+      await cancelPendingSignatureRequestsForFsr(
+        fsrDoc._id,
+        FSR_SIGNATURE_REQUEST_STATUS.CANCELLED
+      );
 
       createNotification({
         type: 'JOB_FSR_TEMPLATE_CHANGED',
@@ -1781,10 +2043,15 @@ router.post(
       fsrDoc.status = FSR_STATUS.SUBMITTED;
       fsrDoc.jobSnapshot = buildJobSnapshot(job);
       fsrDoc.submissionData = submissionData;
+      fsrDoc.draftSignatures = {};
       fsrDoc.assets = assets;
       fsrDoc.submittedBy = req.user._id;
       fsrDoc.submittedAt = new Date();
       await fsrDoc.save();
+      await cancelPendingSignatureRequestsForFsr(
+        fsrDoc._id,
+        FSR_SIGNATURE_REQUEST_STATUS.CANCELLED
+      );
       await fsrDoc.populate('submittedBy', 'name email role');
 
       createNotification({

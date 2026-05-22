@@ -99,6 +99,10 @@ const fsrDocumentSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.Mixed,
       default: undefined,
     },
+    draftSignatures: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
+    },
     assets: {
       type: [fsrAssetSchema],
       default: [],
