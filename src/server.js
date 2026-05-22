@@ -12,6 +12,7 @@ const notificationRoutes = require('./routes/notifications');
 const invitationRoutes = require('./routes/invitations');
 const customerRoutes = require('./routes/customers');
 const techTimeoutRoutes = require('./routes/techTimeouts');
+const fsrDocsRoutes = require('./routes/fsrDocs');
 const { errorHandler, notFound } = require('./middleware/errorHandler');
 
 const app = express();
@@ -44,6 +45,7 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/invitations', invitationRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/tech-timeouts', techTimeoutRoutes);
+app.use('/api/fsr-docs', fsrDocsRoutes);
 
 // Error handling
 app.use(notFound);

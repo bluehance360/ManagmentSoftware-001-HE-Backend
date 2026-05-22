@@ -5,6 +5,7 @@ const Job = require('../models/Job');
 const JobType = require('../models/JobType');
 const JobTypeSettings = require('../models/JobTypeSettings');
 const User = require('../models/User');
+const FsrDocument = require('../models/FsrDocument');
 const { authenticate, authorize } = require('../middleware/auth');
 const { ROLES, JOB_STATUS } = require('../config/constants');
 const JobService = require('../services/JobService');
@@ -15,11 +16,24 @@ const { getIO } = require('../socket');
 const { normalizeDateOnly, isDateOnly, toLocalDateOnly } = require('../utils/dateOnly');
 const {
   buildDocumentKey,
+  buildFsrAssetKey,
   getUploadUrl,
   getDownloadUrl,
   headObject,
   deleteObject,
 } = require('../services/S3Service');
+const {
+  FSR_TEMPLATE,
+  FSR_STATUS,
+  normalizeLevitonExternalLink,
+  attachFsrSummariesToJobs,
+  createFsrDocumentForJob,
+  getFsrDocumentByJobId,
+  syncUnsubmittedFsrDocumentForJob,
+  buildJobSnapshot,
+  formatFsrDocument,
+  resolveFsrTemplateForJobType,
+} = require('../services/FsrService');
 
 const router = express.Router();
 
@@ -42,6 +56,8 @@ const EMPTY_PROGRAMMING_REQUIREMENT_DEFAULTS = {
   newStartup: [],
   existingStartup: [],
 };
+const FSR_IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'heic', 'heif']);
+const FSR_MAX_ASSETS = 10;
 
 function normalizeJobType(value) {
   return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
@@ -137,6 +153,318 @@ function buildAssignmentRequirementRows(requirements, previousRows = []) {
         : null,
     };
   });
+}
+
+function throwBadRequest(message) {
+  const error = new Error(message);
+  error.status = 400;
+  throw error;
+}
+
+function trimString(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function ensureBoolean(value, fieldLabel) {
+  if (typeof value !== 'boolean') {
+    throwBadRequest(`${fieldLabel} must be true or false`);
+  }
+  return value;
+}
+
+function ensureRequiredText(value, fieldLabel) {
+  const normalized = trimString(value);
+  if (!normalized) {
+    throwBadRequest(`${fieldLabel} is required`);
+  }
+  return normalized;
+}
+
+function ensureOptionalEmail(value, fieldLabel) {
+  const normalized = trimString(value);
+  if (!normalized) return '';
+  const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRe.test(normalized)) {
+    throwBadRequest(`${fieldLabel} must be a valid email address`);
+  }
+  return normalized.toLowerCase();
+}
+
+function ensureOptionalPhone(value, fieldLabel) {
+  const normalized = trimString(value);
+  if (!normalized) return '';
+  if (!/^[\d\s()+\-]+$/.test(normalized)) {
+    throwBadRequest(`${fieldLabel} contains invalid characters`);
+  }
+  return normalized;
+}
+
+function ensureOptionalDateOnly(value, fieldLabel) {
+  const normalized = trimString(value);
+  if (!normalized) return '';
+  if (!isDateOnly(normalized)) {
+    throwBadRequest(`${fieldLabel} must be in YYYY-MM-DD format`);
+  }
+  return normalized;
+}
+
+function ensureSignatureDataUrl(value, fieldLabel, required = false) {
+  const normalized = trimString(value);
+  if (!normalized) {
+    if (required) throwBadRequest(`${fieldLabel} is required`);
+    return '';
+  }
+  if (!normalized.startsWith('data:image/')) {
+    throwBadRequest(`${fieldLabel} must be a captured signature image`);
+  }
+  return normalized;
+}
+
+async function normalizeFsrAssets(rawAssets, jobId, userId, maxCount = FSR_MAX_ASSETS) {
+  if (rawAssets === undefined) return [];
+  if (!Array.isArray(rawAssets)) {
+    throwBadRequest('FSR assets must be an array');
+  }
+  if (rawAssets.length > maxCount) {
+    throwBadRequest(`You can upload a maximum of ${maxCount} FSR assets`);
+  }
+
+  const now = new Date();
+  const normalizedAssets = [];
+
+  for (const item of rawAssets) {
+    const key = trimString(item?.key);
+    const fileName = ensureRequiredText(item?.fileName, 'FSR asset file name');
+    const caption = trimString(item?.caption);
+    if (!key.startsWith(`jobs/${jobId}/fsr/`)) {
+      throwBadRequest('Invalid FSR asset key for this job');
+    }
+
+    const meta = await headObject(key);
+    const contentType = String(meta.ContentType || item?.contentType || 'application/octet-stream').trim();
+    if (!contentType.startsWith('image/')) {
+      throwBadRequest(`FSR asset "${fileName}" must be an image`);
+    }
+
+    normalizedAssets.push({
+      key,
+      fileName,
+      contentType,
+      size: Number(meta.ContentLength || item?.size || 0),
+      caption,
+      uploadedBy: userId,
+      uploadedAt: now,
+    });
+  }
+
+  return normalizedAssets;
+}
+
+async function buildSubmissionPayloadForFsr({ fsrDoc, submissionData, job, userId }) {
+  const payload = submissionData && typeof submissionData === 'object' ? submissionData : {};
+
+  if (fsrDoc.templateKey === FSR_TEMPLATE.STANDARD) {
+    const techSupportContacted = ensureBoolean(payload.techSupportContacted, 'Tech Support Contacted');
+    const returnTripNeeded = ensureBoolean(payload.returnTripNeeded, 'Return Trip Needed');
+    const trainingGiven = ensureBoolean(payload.trainingGiven, 'Training Given');
+    const photos = await normalizeFsrAssets(payload.photoAssets, job._id, userId, FSR_MAX_ASSETS);
+
+    return {
+      submissionData: {
+        workPerformed: ensureRequiredText(payload.workPerformed, 'Work Performed'),
+        techSupportContacted,
+        caseNumber: techSupportContacted
+          ? ensureRequiredText(payload.caseNumber, 'Case Number')
+          : '',
+        returnTripNeeded,
+        returnTripReason: returnTripNeeded
+          ? ensureRequiredText(payload.returnTripReason, 'Return Trip Reason')
+          : '',
+        trainingGiven,
+        training: trainingGiven
+          ? {
+              traineeName: trimString(payload.training?.traineeName),
+              traineeCompany: trimString(payload.training?.traineeCompany),
+              traineeSignature: ensureSignatureDataUrl(
+                payload.training?.traineeSignature,
+                'Trainee Signature',
+                false
+              ),
+            }
+          : null,
+        photos,
+        clientAcceptance: {
+          acceptorName: ensureRequiredText(payload.clientAcceptance?.acceptorName, 'Acceptor Name'),
+          acceptorCompany: ensureRequiredText(
+            payload.clientAcceptance?.acceptorCompany,
+            'Acceptor Company'
+          ),
+          acceptorSignature: ensureSignatureDataUrl(
+            payload.clientAcceptance?.acceptorSignature,
+            'Acceptor Signature',
+            true
+          ),
+        },
+      },
+      assets: photos,
+    };
+  }
+
+  if (fsrDoc.templateKey === FSR_TEMPLATE.WATTSTOPPER) {
+    const trainingComplete = ensureBoolean(payload.trainingComplete, 'Training Complete');
+    const programmingComplete = ensureBoolean(payload.programmingComplete, 'Programming Complete');
+    const issuesResolved = ensureBoolean(payload.issuesResolved, 'Were All Issues Resolved');
+    const photos = await normalizeFsrAssets(payload.photoAssets, job._id, userId, FSR_MAX_ASSETS);
+    const weekdays = ['mon', 'tue', 'wed', 'thu', 'fri'];
+    const technicianHours = {};
+    const ecHours = {};
+
+    weekdays.forEach((day) => {
+      technicianHours[day] = trimString(payload.hoursOnSite?.technicianHours?.[day]);
+      ecHours[day] = trimString(payload.hoursOnSite?.ecHours?.[day]);
+    });
+
+    return {
+      submissionData: {
+        siteContact: {
+          name: trimString(payload.siteContact?.name),
+          title: trimString(payload.siteContact?.title),
+          company: trimString(payload.siteContact?.company),
+          phone: ensureOptionalPhone(payload.siteContact?.phone, 'Site Contact Phone'),
+          email: ensureOptionalEmail(payload.siteContact?.email, 'Site Contact Email'),
+        },
+        trainingComplete,
+        trainingReason: !trainingComplete
+          ? ensureRequiredText(payload.trainingReason, 'Training Reason')
+          : '',
+        training: trainingComplete
+          ? {
+              dateOfTraining: ensureOptionalDateOnly(
+                payload.training?.dateOfTraining,
+                'Date of Training'
+              ),
+              traineeName: trimString(payload.training?.traineeName),
+              traineeCompany: trimString(payload.training?.traineeCompany),
+              traineeSignature: ensureSignatureDataUrl(
+                payload.training?.traineeSignature,
+                'Trainee Signature',
+                false
+              ),
+            }
+          : null,
+        hoursOnSite: {
+          technicianHours,
+          ecHours,
+        },
+        programmingComplete,
+        programmingReason: !programmingComplete
+          ? ensureRequiredText(payload.programmingReason, 'Programming Reason')
+          : '',
+        issuesResolved,
+        programmingDetailsAndNotes: trimString(payload.programmingDetailsAndNotes),
+        photos,
+        reportReceivedBy: {
+          name: ensureRequiredText(payload.reportReceivedBy?.name, 'Report Received By Name'),
+          title: ensureRequiredText(payload.reportReceivedBy?.title, 'Report Received By Title'),
+          company: ensureRequiredText(
+            payload.reportReceivedBy?.company,
+            'Report Received By Company'
+          ),
+          signature: ensureSignatureDataUrl(
+            payload.reportReceivedBy?.signature,
+            'Report Received By Signature',
+            true
+          ),
+        },
+      },
+      assets: photos,
+    };
+  }
+
+  if (fsrDoc.templateKey === FSR_TEMPLATE.LEVITON_EXTERNAL) {
+    const completionConfirmed = ensureBoolean(payload.completionConfirmed, 'Completion');
+    if (!completionConfirmed) {
+      throwBadRequest('Completion must be checked before submitting the Leviton FSR');
+    }
+
+    const screenshotAssets = payload.screenshotAsset
+      ? await normalizeFsrAssets([payload.screenshotAsset], job._id, userId, 1)
+      : [];
+
+    return {
+      submissionData: {
+        completionConfirmed: true,
+        externalFsrReferenceNumber: trimString(payload.externalFsrReferenceNumber),
+        internalNotes: trimString(payload.internalNotes),
+        screenshot: screenshotAssets[0] || null,
+      },
+      assets: screenshotAssets,
+    };
+  }
+
+  throwBadRequest('Unsupported FSR template');
+}
+
+async function attachAssetUrlsToFsrData(data) {
+  if (!data || !Array.isArray(data.assets) || data.assets.length === 0) return data;
+
+  const assets = await Promise.all(
+    data.assets.map(async (asset) => ({
+      ...asset,
+      url: await getDownloadUrl({
+        key: asset.key,
+        fileName: asset.fileName,
+        expiresIn: 900,
+      }),
+    }))
+  );
+
+  const urlByKey = new Map(assets.map((asset) => [asset.key, asset.url]));
+  data.assets = assets;
+
+  if (data.templateKey === FSR_TEMPLATE.LEVITON_EXTERNAL && data.submissionData?.screenshot?.key) {
+    data.submissionData = {
+      ...data.submissionData,
+      screenshot: {
+        ...data.submissionData.screenshot,
+        url: urlByKey.get(data.submissionData.screenshot.key) || '',
+      },
+    };
+  }
+
+  if (
+    (data.templateKey === FSR_TEMPLATE.STANDARD || data.templateKey === FSR_TEMPLATE.WATTSTOPPER) &&
+    Array.isArray(data.submissionData?.photos)
+  ) {
+    data.submissionData = {
+      ...data.submissionData,
+      photos: data.submissionData.photos.map((photo) => ({
+        ...photo,
+        url: photo?.key ? urlByKey.get(photo.key) || '' : '',
+      })),
+    };
+  }
+
+  return data;
+}
+
+async function buildFsrResponseData(job, fsrDoc) {
+  const data = await attachAssetUrlsToFsrData(formatFsrDocument(fsrDoc));
+  data.job = {
+    _id: job._id,
+    title: job.title,
+    address:
+      typeof job.address === 'string' && job.address.trim()
+        ? job.address
+        : String(job.customer?.address || '').trim(),
+    companyName: job.companyName || '',
+    customerName: job.customer?.name || job.customerName || '',
+    assignedTechnician: job.assignedTechnician || null,
+    secondaryAssignedTechnician: job.secondaryAssignedTechnician || null,
+    status: job.status,
+  };
+
+  return data;
 }
 
 async function resolveAssignmentRequirementsForJob(jobDoc, overrideRows = null) {
@@ -696,6 +1024,7 @@ router.get('/', async (req, res) => {
     ]);
 
     await annotateJobsWithLinkedReturnFlag(jobs);
+    await attachFsrSummariesToJobs(jobs);
 
     res.json({
       success: true,
@@ -937,6 +1266,8 @@ router.get('/:id', async (req, res) => {
     const documentFamilyJobs = await loadDocumentFamilyJobs(job);
     data.documents = mergeFamilyDocuments(documentFamilyJobs);
     data.returnVisitJobs = returnVisitJobs;
+    const fsrDoc = await getFsrDocumentByJobId(job._id);
+    data.fsrSummary = fsrDoc ? formatFsrDocument(fsrDoc).summary : null;
 
     res.json({ success: true, data });
   } catch (error) {
@@ -956,6 +1287,7 @@ router.post(
     body('scheduledDate').notEmpty().withMessage('Scheduled date is required').custom(validateScheduledDate),
     body('estimatedCost').optional().isFloat({ min: 0 }).withMessage('Must be a positive number'),
     body('companyName').optional().trim(),
+    body('levitonExternalFsrLink').optional().isString().withMessage('External FSR link must be a string'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -994,6 +1326,10 @@ router.post(
       await ensureJobTypeSaved(req.body.jobType);
 
       const job = await JobService.createJob(req.body, req.user._id);
+      await createFsrDocumentForJob(job, {
+        levitonExternalLink: req.body.levitonExternalFsrLink,
+      });
+      await attachFsrSummariesToJobs([job]);
 
       // Notify admins and managers
       createNotification({
@@ -1008,6 +1344,273 @@ router.post(
       res.status(201).json({ success: true, data: job });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── GET /api/jobs/:id/fsr ───────────────────────────────────────────
+router.get('/:id/fsr', async (req, res) => {
+  try {
+    const job = await Job.findById(req.params.id)
+      .select(
+        '_id title address customer customerName companyName assignedTechnician secondaryAssignedTechnician status parentJob jobVisitKind'
+      )
+      .populate('customer', 'name address')
+      .populate('assignedTechnician', 'name email')
+      .populate('secondaryAssignedTechnician', 'name email')
+      .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
+
+    if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+    if (!canAccessJob(req.user, job)) {
+      return res.status(403).json({ success: false, error: 'Not authorized to view this FSR' });
+    }
+
+    const fsrDoc = await getFsrDocumentByJobId(job._id);
+    if (!fsrDoc) {
+      return res.status(404).json({ success: false, error: 'No FSR document is attached to this job' });
+    }
+
+    return res.json({ success: true, data: await buildFsrResponseData(job, fsrDoc) });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ── POST /api/jobs/:id/fsr/open ─────────────────────────────────────
+router.post('/:id/fsr/open', async (req, res) => {
+  try {
+    const job = await Job.findById(req.params.id)
+      .select(
+        '_id title address customer customerName companyName assignedTechnician secondaryAssignedTechnician status parentJob jobVisitKind'
+      )
+      .populate('customer', 'name address')
+      .populate('assignedTechnician', 'name email')
+      .populate('secondaryAssignedTechnician', 'name email')
+      .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
+
+    if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+    if (!canAccessJob(req.user, job)) {
+      return res.status(403).json({ success: false, error: 'Not authorized to open this FSR' });
+    }
+
+    let fsrDoc = await getFsrDocumentByJobId(job._id);
+    if (!fsrDoc) {
+      return res.status(404).json({ success: false, error: 'No FSR document is attached to this job' });
+    }
+
+    const transitionedDoc = await FsrDocument.findOneAndUpdate(
+      { job: job._id, status: FSR_STATUS.NOT_STARTED },
+      { $set: { status: FSR_STATUS.IN_PROGRESS } },
+      { new: true }
+    );
+
+    const transitionedToInProgress = Boolean(transitionedDoc);
+    if (transitionedDoc) {
+      fsrDoc = transitionedDoc;
+
+      const recipientIds = [];
+      if (job.assignedTechnician?._id) recipientIds.push(job.assignedTechnician._id);
+      if (job.secondaryAssignedTechnician?._id) recipientIds.push(job.secondaryAssignedTechnician._id);
+
+      createNotification({
+        type: 'JOB_FSR_OPENED',
+        message: `${actorWithRole(req.user)} started the ${formatFsrDocument(fsrDoc).templateLabel} for job "${job.title}"`,
+        jobId: job._id,
+        recipientIds,
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        excludeUserId: req.user._id,
+        dedupeKey: `fsr-opened:${job._id}`,
+      });
+
+      broadcastJobUpdate();
+    } else {
+      fsrDoc = await getFsrDocumentByJobId(job._id);
+    }
+
+    return res.json({
+      success: true,
+      data: await buildFsrResponseData(job, fsrDoc),
+      meta: { transitionedToInProgress },
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ── PATCH /api/jobs/:id/fsr/link ────────────────────────────────────
+router.patch(
+  '/:id/fsr/link',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  [body('levitonExternalLink').optional().isString().withMessage('levitonExternalLink must be a string')],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const fsrDoc = await getFsrDocumentByJobId(req.params.id);
+      if (!fsrDoc) {
+        return res.status(404).json({ success: false, error: 'No FSR document is attached to this job' });
+      }
+      if (fsrDoc.templateKey !== FSR_TEMPLATE.LEVITON_EXTERNAL) {
+        return res.status(400).json({ success: false, error: 'External link is only available for Leviton FSRs' });
+      }
+      if (fsrDoc.status === FSR_STATUS.SUBMITTED) {
+        return res.status(400).json({ success: false, error: 'Submitted FSRs are read-only' });
+      }
+
+      fsrDoc.levitonExternalLink = normalizeLevitonExternalLink(req.body.levitonExternalLink);
+      await fsrDoc.save();
+      broadcastJobUpdate();
+      return res.json({ success: true, data: await attachAssetUrlsToFsrData(formatFsrDocument(fsrDoc)) });
+    } catch (error) {
+      const status = error.status || 500;
+      return res.status(status).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── POST /api/jobs/:id/fsr/assets/presign ───────────────────────────
+router.post(
+  '/:id/fsr/assets/presign',
+  [
+    body('files').isArray({ min: 1 }).withMessage('files must be a non-empty array'),
+    body('files.*.name').notEmpty().withMessage('file name is required'),
+    body('files.*.contentType').optional().isString(),
+    body('files.*.size').optional().isInt({ min: 0 }).withMessage('file size must be >= 0'),
+    body('files.*.caption').optional().isString().withMessage('file caption must be a string'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const job = await Job.findById(req.params.id)
+        .select('_id title status assignedTechnician secondaryAssignedTechnician parentJob jobVisitKind')
+        .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
+      if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (!canAccessJob(req.user, job)) {
+        return res.status(403).json({ success: false, error: 'Not authorized to upload FSR assets for this job' });
+      }
+
+      const fsrDoc = await getFsrDocumentByJobId(job._id);
+      if (!fsrDoc) {
+        return res.status(404).json({ success: false, error: 'No FSR document is attached to this job' });
+      }
+      if (fsrDoc.status === FSR_STATUS.SUBMITTED) {
+        return res.status(400).json({ success: false, error: 'Submitted FSRs are read-only' });
+      }
+
+      const files = req.body.files.slice(0, FSR_MAX_ASSETS);
+      const invalid = files.find((file) => {
+        const ext = String(file.name || '').split('.').pop().toLowerCase();
+        return !FSR_IMAGE_EXTENSIONS.has(ext);
+      });
+      if (invalid) {
+        return res.status(400).json({
+          success: false,
+          error: `File type not allowed: "${invalid.name}". Accepted: PNG, JPG, JPEG, WEBP, HEIC, HEIF`,
+        });
+      }
+
+      const uploads = await Promise.all(
+        files.map(async (file) => {
+          const key = buildFsrAssetKey(job._id.toString(), file.name);
+          const contentType = file.contentType || 'application/octet-stream';
+          const presignedUrl = await getUploadUrl({ key, contentType, expiresIn: 300 });
+          return {
+            key,
+            fileName: file.name,
+            contentType,
+            size: Number(file.size) || 0,
+            caption: trimString(file.caption),
+            presignedUrl,
+            expiresIn: 300,
+          };
+        })
+      );
+
+      return res.json({ success: true, data: { uploads } });
+    } catch (error) {
+      const status = error.status || 500;
+      return res.status(status).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── POST /api/jobs/:id/fsr/submit ───────────────────────────────────
+router.post(
+  '/:id/fsr/submit',
+  [body('submissionData').optional().isObject().withMessage('submissionData must be an object')],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const job = await Job.findById(req.params.id)
+        .select(
+          '_id title address customer customerName companyName assignedTechnician secondaryAssignedTechnician status parentJob jobVisitKind'
+        )
+        .populate('customer', 'name address')
+        .populate('assignedTechnician', 'name email')
+        .populate('secondaryAssignedTechnician', 'name email')
+        .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
+      if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (!canAccessJob(req.user, job)) {
+        return res.status(403).json({ success: false, error: 'Not authorized to submit this FSR' });
+      }
+
+      const fsrDoc = await getFsrDocumentByJobId(job._id);
+      if (!fsrDoc) {
+        return res.status(404).json({ success: false, error: 'No FSR document is attached to this job' });
+      }
+      if (fsrDoc.status === FSR_STATUS.SUBMITTED) {
+        return res.status(400).json({ success: false, error: 'This FSR has already been submitted' });
+      }
+      if (
+        fsrDoc.templateKey === FSR_TEMPLATE.LEVITON_EXTERNAL &&
+        !trimString(fsrDoc.levitonExternalLink)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: 'An external Leviton FSR link must be set before submitting this form',
+        });
+      }
+
+      const { submissionData, assets } = await buildSubmissionPayloadForFsr({
+        fsrDoc,
+        submissionData: req.body.submissionData,
+        job,
+        userId: req.user._id,
+      });
+
+      fsrDoc.status = FSR_STATUS.SUBMITTED;
+      fsrDoc.jobSnapshot = buildJobSnapshot(job);
+      fsrDoc.submissionData = submissionData;
+      fsrDoc.assets = assets;
+      fsrDoc.submittedBy = req.user._id;
+      fsrDoc.submittedAt = new Date();
+      await fsrDoc.save();
+      await fsrDoc.populate('submittedBy', 'name email role');
+
+      createNotification({
+        type: 'JOB_FSR_SUBMITTED',
+        message: `${actorWithRole(req.user)} submitted the ${formatFsrDocument(fsrDoc).templateLabel} for job "${job.title}"`,
+        jobId: job._id,
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        excludeUserId: req.user._id,
+      });
+
+      broadcastJobUpdate();
+      return res.json({ success: true, data: await attachAssetUrlsToFsrData(formatFsrDocument(fsrDoc)) });
+    } catch (error) {
+      const status = error.status || 500;
+      return res.status(status).json({ success: false, error: error.message });
     }
   }
 );
@@ -1575,6 +2178,11 @@ router.post(
         { path: 'customer', select: 'name phone email address firstPageRequired' },
         { path: 'parentJob', select: 'title scheduledDate status' },
       ]);
+      const parentFsrDoc = await getFsrDocumentByJobId(parent._id);
+      await createFsrDocumentForJob(child, {
+        levitonExternalLink: parentFsrDoc?.levitonExternalLink || '',
+      });
+      await attachFsrSummariesToJobs([child]);
 
       if (!parent.returnWorkflow) parent.returnWorkflow = {};
       parent.returnWorkflow.reason = 'RETURN_VISIT';
@@ -2685,8 +3293,17 @@ router.delete(
       const jobTitle = job.title;
       const techId = job.assignedTechnician?._id;
       const secondaryTechId = job.secondaryAssignedTechnician?._id;
+      const fsrDoc = await getFsrDocumentByJobId(req.params.id);
 
       await Job.findByIdAndDelete(req.params.id);
+      if (fsrDoc) {
+        await Promise.all(
+          (fsrDoc.assets || [])
+            .filter((asset) => asset?.key)
+            .map((asset) => deleteObject(asset.key).catch(() => null))
+        );
+        await fsrDoc.deleteOne();
+      }
 
       // Notify relevant people based on job visibility
       const notifRecipientIds = [];
@@ -2731,6 +3348,7 @@ router.put(
     body('title').optional().notEmpty().withMessage('Title cannot be empty'),
     body('jobType').optional().isString().withMessage('Job type must be a string'),
     body('programmingSubtype').optional().isString().withMessage('Programming subtype must be a string'),
+    body('levitonExternalFsrLink').optional().isString().withMessage('External FSR link must be a string'),
     body('customerEmail').optional().isEmail().withMessage('Invalid customer email'),
     body('scheduledDate').optional().custom(validateScheduledDate),
     body('estimatedCost').optional().isFloat({ min: 0 }).withMessage('Must be positive'),
@@ -2760,7 +3378,10 @@ router.put(
         await ensureJobTypeSaved(req.body.jobType);
       }
 
-      if (req.body.jobType !== undefined || req.body.programmingSubtype !== undefined) {
+      if (
+        req.body.jobType !== undefined ||
+        req.body.programmingSubtype !== undefined
+      ) {
         const finalJobType = normalizeJobType(
           req.body.jobType !== undefined ? req.body.jobType : existingJob.jobType,
         );
@@ -2783,10 +3404,19 @@ router.put(
         }
       }
 
+      const levitonExternalFsrLink = req.body.levitonExternalFsrLink;
+      if (req.body.levitonExternalFsrLink !== undefined) {
+        delete req.body.levitonExternalFsrLink;
+      }
+
       const result = await JobService.updateJobDetails(req.params.id, req.body);
       if (result.error) {
         return res.status(result.status).json({ success: false, error: result.error });
       }
+      await syncUnsubmittedFsrDocumentForJob(result.data, {
+        levitonExternalLink,
+      });
+      await attachFsrSummariesToJobs([result.data]);
 
       // Notify relevant people based on job visibility
       const updatedJob = result.data;

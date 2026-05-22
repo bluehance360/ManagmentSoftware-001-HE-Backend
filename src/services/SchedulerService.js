@@ -160,6 +160,7 @@ async function checkOverdueAssignedJobs() {
       jobId: job._id,
       recipientIds,
       recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+      dedupeKey: `overdue-24h:${job._id}:${assignedAt.toISOString()}`,
     });
     sent += 1;
   }
@@ -203,6 +204,7 @@ async function checkMissingDocumentReminders() {
         message: `Reminder: Job "${job.title}" is scheduled in ~${hours} hour(s) and still has missing required documents.`,
         jobId: job._id,
         recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        dedupeKey: `docs-missing:${job._id}:${job.scheduledDate}:${hours}`,
       });
       sent += 1;
     }
@@ -231,6 +233,7 @@ async function checkStartedJobsWithPendingDocuments() {
       message: `Job "${job.title}" has started but required documents are still pending.`,
       jobId: job._id,
       recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+      dedupeKey: `started-docs-pending:${job._id}`,
     });
     sent += 1;
   }

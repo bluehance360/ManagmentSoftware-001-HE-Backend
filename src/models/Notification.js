@@ -24,6 +24,8 @@ const notificationSchema = new mongoose.Schema(
         'JOB_DOCUMENT_DELETED',
         'JOB_DOCUMENTS_UPDATED',
         'JOB_UPDATED',
+        'JOB_FSR_OPENED',
+        'JOB_FSR_SUBMITTED',
         'JOB_DELETED',
         'JOB_RETURN_VISIT_CREATED',
         'JOB_RETURN_WORKFLOW_UPDATED',
@@ -46,6 +48,7 @@ const notificationSchema = new mongoose.Schema(
     },
     message: { type: String, required: true },
     job: { type: mongoose.Schema.Types.ObjectId, ref: 'Job' },
+    dedupeKey: { type: String, default: undefined },
     meta: { type: mongoose.Schema.Types.Mixed },
     read: { type: Boolean, default: false },
   },
@@ -53,5 +56,9 @@ const notificationSchema = new mongoose.Schema(
 );
 
 notificationSchema.index({ recipient: 1, read: 1, createdAt: -1 });
+notificationSchema.index(
+  { recipient: 1, dedupeKey: 1 },
+  { unique: true, partialFilterExpression: { dedupeKey: { $type: 'string' } } }
+);
 
 module.exports = mongoose.model('Notification', notificationSchema);

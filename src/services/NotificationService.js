@@ -14,6 +14,7 @@ const { sendPushToUsers } = require('./PushService');
  * @param {string[]} [opts.recipientIds] - explicit recipient user ids
  * @param {string[]} [opts.recipientRoles] - send to all users with these roles
  * @param {string} [opts.excludeUserId] - exclude this user (the actor)
+ * @param {string} [opts.dedupeKey] - optional idempotency key per recipient
  */
 async function createNotification({
   type,
@@ -23,6 +24,7 @@ async function createNotification({
   recipientIds,
   recipientRoles,
   excludeUserId,
+  dedupeKey,
 }) {
   try {
     let recipients = [];
@@ -49,21 +51,49 @@ async function createNotification({
 
     if (recipients.length === 0) return;
 
-    const docs = recipients.map((recipientId) => ({
-      recipient: recipientId,
-      type,
-      message,
-      job: jobId,
-      meta,
-    }));
+    let notifiedRecipients = recipients;
 
-    await Notification.insertMany(docs);
+    if (dedupeKey) {
+      const operations = recipients.map((recipientId) => ({
+        updateOne: {
+          filter: { recipient: recipientId, dedupeKey },
+          update: {
+            $setOnInsert: {
+              recipient: recipientId,
+              type,
+              message,
+              job: jobId,
+              meta,
+              dedupeKey,
+              read: false,
+            },
+          },
+          upsert: true,
+        },
+      }));
+
+      const result = await Notification.bulkWrite(operations, { ordered: false });
+      const insertedIndexes = Object.keys(result.upsertedIds || {}).map((key) => Number(key));
+      notifiedRecipients = insertedIndexes.map((index) => recipients[index]).filter(Boolean);
+    } else {
+      const docs = recipients.map((recipientId) => ({
+        recipient: recipientId,
+        type,
+        message,
+        job: jobId,
+        meta,
+      }));
+
+      await Notification.insertMany(docs);
+    }
+
+    if (notifiedRecipients.length === 0) return;
 
     // Emit real-time socket event to recipients
     emitToUsers({
       event: 'notification',
       data: { type, message, jobId, meta },
-      recipientIds: recipients,
+      recipientIds: notifiedRecipients,
       excludeUserId,
     });
 
@@ -76,7 +106,7 @@ async function createNotification({
     ]);
 
     // Send Web Push to offline users (fire-and-forget)
-    sendPushToUsers(recipients, {
+    sendPushToUsers(notifiedRecipients, {
       title: 'Hosanna Electric',
       body: message,
       icon: '/Hosanna-logo.webp',
