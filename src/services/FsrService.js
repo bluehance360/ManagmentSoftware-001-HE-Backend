@@ -13,6 +13,11 @@ const FSR_STATUS = {
   SUBMITTED: 'SUBMITTED',
 };
 
+const FSR_TEMPLATE_SOURCE = {
+  AUTO: 'AUTO',
+  MANUAL_OVERRIDE: 'MANUAL_OVERRIDE',
+};
+
 const FSR_TEMPLATE_LABELS = {
   [FSR_TEMPLATE.STANDARD]: 'Standard FSR',
   [FSR_TEMPLATE.WATTSTOPPER]: 'Wattstopper FSR',
@@ -23,15 +28,23 @@ function normalizeJobType(value) {
   return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ').toLowerCase() : '';
 }
 
-function resolveFsrTemplateForJobType(jobType) {
+function hasProgrammingSubtype(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function resolveFsrTemplateForJobType(jobType, opts = {}) {
   const normalized = normalizeJobType(jobType);
   if (normalized === 'wattstopper') return FSR_TEMPLATE.WATTSTOPPER;
   if (normalized === 'leviton') return FSR_TEMPLATE.LEVITON_EXTERNAL;
-  return FSR_TEMPLATE.STANDARD;
+  return opts.isProgramming || hasProgrammingSubtype(opts.programmingSubtype)
+    ? FSR_TEMPLATE.STANDARD
+    : null;
 }
 
 function normalizeLevitonExternalLink(value) {
-  return typeof value === 'string' ? value.trim() : '';
+  const normalized = typeof value === 'string' ? value.trim() : '';
+  if (!normalized) return '';
+  return /^[a-z][a-z\d+\-.]*:/i.test(normalized) ? normalized : `https://${normalized}`;
 }
 
 function buildFsrSummary(doc) {
@@ -39,10 +52,13 @@ function buildFsrSummary(doc) {
   return {
     _id: doc._id,
     templateKey: doc.templateKey,
+    templateSource: doc.templateSource || FSR_TEMPLATE_SOURCE.AUTO,
     templateLabel: FSR_TEMPLATE_LABELS[doc.templateKey] || doc.templateKey,
     status: doc.status,
+    technicianVisible: Boolean(doc.technicianVisible),
     submittedAt: doc.submittedAt || null,
     hasExternalLink: Boolean(doc.levitonExternalLink),
+    levitonExternalLink: doc.levitonExternalLink || '',
   };
 }
 
@@ -66,7 +82,7 @@ async function attachFsrSummariesToJobs(jobs) {
   if (!jobIds.length) return jobs;
 
   const docs = await FsrDocument.find({ job: { $in: jobIds } })
-    .select('job templateKey status submittedAt levitonExternalLink')
+    .select('job templateKey status technicianVisible submittedAt levitonExternalLink')
     .lean();
 
   const summaryByJobId = new Map(
@@ -82,7 +98,11 @@ async function attachFsrSummariesToJobs(jobs) {
 
 async function createFsrDocumentForJob(jobDoc, opts = {}) {
   if (!jobDoc?._id) return null;
-  const templateKey = resolveFsrTemplateForJobType(jobDoc.jobType);
+  const templateKey = resolveFsrTemplateForJobType(jobDoc.jobType, {
+    isProgramming: opts.isProgramming,
+    programmingSubtype: jobDoc.programmingSubtype,
+  });
+  if (!templateKey) return null;
   const levitonExternalLink =
     templateKey === FSR_TEMPLATE.LEVITON_EXTERNAL
       ? normalizeLevitonExternalLink(opts.levitonExternalLink)
@@ -94,7 +114,9 @@ async function createFsrDocumentForJob(jobDoc, opts = {}) {
       $setOnInsert: {
         job: jobDoc._id,
         templateKey,
+        templateSource: FSR_TEMPLATE_SOURCE.AUTO,
         status: FSR_STATUS.NOT_STARTED,
+        technicianVisible: false,
         levitonExternalLink,
       },
     },
@@ -109,9 +131,22 @@ async function getFsrDocumentByJobId(jobId) {
 async function syncUnsubmittedFsrDocumentForJob(jobDoc, opts = {}) {
   if (!jobDoc?._id) return null;
   const doc = await FsrDocument.findOne({ job: jobDoc._id });
-  if (!doc || doc.status === FSR_STATUS.SUBMITTED) return doc;
+  const defaultTemplateKey = resolveFsrTemplateForJobType(jobDoc.jobType, {
+    isProgramming: opts.isProgramming,
+    programmingSubtype: jobDoc.programmingSubtype,
+  });
 
-  const nextTemplateKey = resolveFsrTemplateForJobType(jobDoc.jobType);
+  if (!doc) {
+    return defaultTemplateKey ? createFsrDocumentForJob(jobDoc, opts) : null;
+  }
+  if (doc.status === FSR_STATUS.SUBMITTED) return doc;
+
+  const nextTemplateKey =
+    doc.templateSource === FSR_TEMPLATE_SOURCE.MANUAL_OVERRIDE ? doc.templateKey : defaultTemplateKey;
+  if (!nextTemplateKey) {
+    await doc.deleteOne();
+    return null;
+  }
   doc.templateKey = nextTemplateKey;
   doc.status = FSR_STATUS.NOT_STARTED;
   doc.submissionData = undefined;
@@ -169,6 +204,7 @@ function formatFsrDocument(doc) {
 module.exports = {
   FSR_TEMPLATE,
   FSR_STATUS,
+  FSR_TEMPLATE_SOURCE,
   FSR_TEMPLATE_LABELS,
   resolveFsrTemplateForJobType,
   normalizeLevitonExternalLink,

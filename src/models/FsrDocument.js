@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 
 const FSR_TEMPLATE_KEYS = ['STANDARD', 'WATTSTOPPER', 'LEVITON_EXTERNAL'];
 const FSR_STATUSES = ['NOT_STARTED', 'IN_PROGRESS', 'SUBMITTED'];
+const FSR_TEMPLATE_SOURCES = ['AUTO', 'MANUAL_OVERRIDE'];
 
 const fsrAssetSchema = new mongoose.Schema(
   {
@@ -70,11 +71,20 @@ const fsrDocumentSchema = new mongoose.Schema(
       enum: FSR_TEMPLATE_KEYS,
       required: true,
     },
+    templateSource: {
+      type: String,
+      enum: FSR_TEMPLATE_SOURCES,
+      default: 'AUTO',
+    },
     status: {
       type: String,
       enum: FSR_STATUSES,
       default: 'NOT_STARTED',
       index: true,
+    },
+    technicianVisible: {
+      type: Boolean,
+      default: false,
     },
     levitonExternalLink: {
       type: String,

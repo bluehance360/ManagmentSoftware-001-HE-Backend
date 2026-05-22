@@ -17,6 +17,7 @@ const JobType = require('../models/JobType');
 const TechTimeout = require('../models/TechTimeout');
 const { ROLES, JOB_STATUS, STATUS_TRANSITIONS, TIMEOUT_REQUEST_STATUS } = require('../config/constants');
 const { normalizeDateOnly, toLocalDateOnly } = require('../utils/dateOnly');
+const { getFsrDocumentByJobId, FSR_STATUS } = require('./FsrService');
 
 /**
  * Look up the JobType doc matching a job's stored jobType name (case-insensitive).
@@ -230,6 +231,20 @@ async function transitionStatus(jobId, newStatus, user, notes) {
       return {
         error:
           'This job is flagged for an internal (our) issue review. An Admin or Office Manager must approve before it can be marked completed.',
+        status: 400,
+      };
+    }
+  }
+
+  if (
+    user.role === ROLES.TECHNICIAN &&
+    currentStatus === JOB_STATUS.IN_PROGRESS &&
+    newStatus === JOB_STATUS.COMPLETED
+  ) {
+    const fsrDoc = await getFsrDocumentByJobId(jobId);
+    if (fsrDoc && fsrDoc.status !== FSR_STATUS.SUBMITTED) {
+      return {
+        error: 'FSR must be submitted before this job can be marked completed.',
         status: 400,
       };
     }

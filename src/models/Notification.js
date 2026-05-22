@@ -25,6 +25,8 @@ const notificationSchema = new mongoose.Schema(
         'JOB_DOCUMENTS_UPDATED',
         'JOB_UPDATED',
         'JOB_FSR_OPENED',
+        'JOB_FSR_TEMPLATE_CHANGED',
+        'JOB_FSR_LINK_UPDATED',
         'JOB_FSR_SUBMITTED',
         'JOB_DELETED',
         'JOB_RETURN_VISIT_CREATED',

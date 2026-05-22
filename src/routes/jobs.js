@@ -25,6 +25,7 @@ const {
 const {
   FSR_TEMPLATE,
   FSR_STATUS,
+  FSR_TEMPLATE_SOURCE,
   normalizeLevitonExternalLink,
   attachFsrSummariesToJobs,
   createFsrDocumentForJob,
@@ -633,6 +634,34 @@ function formatRoleLabel(role) {
 
 function actorWithRole(user) {
   return `${user.name} (${formatRoleLabel(user.role)})`;
+}
+
+function hasAssignedTechnician(job) {
+  return Boolean(
+    job?.assignedTechnician?._id ||
+      job?.assignedTechnician ||
+      job?.secondaryAssignedTechnician?._id ||
+      job?.secondaryAssignedTechnician
+  );
+}
+
+function toObjectIdString(value) {
+  const raw = value?._id || value;
+  return raw ? String(raw) : '';
+}
+
+function getVisibleFsrTechnicianRecipientIds(job, fsrDoc) {
+  if (!fsrDoc?.technicianVisible) return [];
+  return [job?.assignedTechnician, job?.secondaryAssignedTechnician]
+    .map((entry) => toObjectIdString(entry))
+    .filter(Boolean);
+}
+
+function canUserOpenVisibleFsr(user, job, fsrDoc) {
+  if (!user || !job || !fsrDoc) return false;
+  if ([ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(user.role)) return true;
+  if (user.role !== ROLES.TECHNICIAN) return false;
+  return canAccessJob(user, job) && Boolean(fsrDoc.technicianVisible);
 }
 
 function notifyAssignmentDocumentChange({ job, documentFieldName, action, actorUser }) {
@@ -1369,6 +1398,12 @@ router.get('/:id/fsr', async (req, res) => {
     if (!fsrDoc) {
       return res.status(404).json({ success: false, error: 'No FSR document is attached to this job' });
     }
+    if (!canUserOpenVisibleFsr(req.user, job, fsrDoc)) {
+      return res.status(403).json({
+        success: false,
+        error: 'This FSR will become available after you start the completion flow from Mark Completed.',
+      });
+    }
 
     return res.json({ success: true, data: await buildFsrResponseData(job, fsrDoc) });
   } catch (error) {
@@ -1398,39 +1433,73 @@ router.post('/:id/fsr/open', async (req, res) => {
       return res.status(404).json({ success: false, error: 'No FSR document is attached to this job' });
     }
 
-    const transitionedDoc = await FsrDocument.findOneAndUpdate(
-      { job: job._id, status: FSR_STATUS.NOT_STARTED },
-      { $set: { status: FSR_STATUS.IN_PROGRESS } },
-      { new: true }
-    );
+    const revealForTechnicianCompletion = Boolean(req.body?.revealForTechnicianCompletion);
+    let technicianVisibleUnlocked = false;
+
+    if (req.user.role === ROLES.TECHNICIAN && !fsrDoc.technicianVisible) {
+      if (!revealForTechnicianCompletion) {
+        return res.status(403).json({
+          success: false,
+          error: 'This FSR will become available after you start the completion flow from Mark Completed.',
+        });
+      }
+      if (job.status !== JOB_STATUS.IN_PROGRESS) {
+        return res.status(400).json({
+          success: false,
+          error: 'This FSR can only be started from the completion flow while the job is in progress.',
+        });
+      }
+
+      const unlockedDoc = await FsrDocument.findOneAndUpdate(
+        { job: job._id, technicianVisible: { $ne: true } },
+        { $set: { technicianVisible: true } },
+        { new: true }
+      );
+      technicianVisibleUnlocked = Boolean(unlockedDoc);
+      fsrDoc = unlockedDoc || (await getFsrDocumentByJobId(job._id));
+    }
+
+    if (!canUserOpenVisibleFsr(req.user, job, fsrDoc)) {
+      return res.status(403).json({
+        success: false,
+        error: 'This FSR will become available after you start the completion flow from Mark Completed.',
+      });
+    }
+
+    const transitionedDoc = hasAssignedTechnician(job)
+      ? await FsrDocument.findOneAndUpdate(
+          { job: job._id, status: FSR_STATUS.NOT_STARTED },
+          { $set: { status: FSR_STATUS.IN_PROGRESS } },
+          { new: true }
+        )
+      : null;
 
     const transitionedToInProgress = Boolean(transitionedDoc);
+    const shouldNotifyOpened = transitionedToInProgress || technicianVisibleUnlocked;
+
     if (transitionedDoc) {
       fsrDoc = transitionedDoc;
+    } else if (!fsrDoc) {
+      fsrDoc = await getFsrDocumentByJobId(job._id);
+    }
 
-      const recipientIds = [];
-      if (job.assignedTechnician?._id) recipientIds.push(job.assignedTechnician._id);
-      if (job.secondaryAssignedTechnician?._id) recipientIds.push(job.secondaryAssignedTechnician._id);
-
+    if (shouldNotifyOpened) {
       createNotification({
         type: 'JOB_FSR_OPENED',
         message: `${actorWithRole(req.user)} started the ${formatFsrDocument(fsrDoc).templateLabel} for job "${job.title}"`,
         jobId: job._id,
-        recipientIds,
+        recipientIds: getVisibleFsrTechnicianRecipientIds(job, fsrDoc),
         recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,
-        dedupeKey: `fsr-opened:${job._id}`,
       });
 
       broadcastJobUpdate();
-    } else {
-      fsrDoc = await getFsrDocumentByJobId(job._id);
     }
 
     return res.json({
       success: true,
       data: await buildFsrResponseData(job, fsrDoc),
-      meta: { transitionedToInProgress },
+      meta: { transitionedToInProgress, technicianVisibleUnlocked },
     });
   } catch (error) {
     return res.status(500).json({ success: false, error: error.message });
@@ -1449,6 +1518,12 @@ router.patch(
     }
 
     try {
+      const job = await Job.findById(req.params.id)
+        .select('_id title assignedTechnician secondaryAssignedTechnician');
+      if (!job) {
+        return res.status(404).json({ success: false, error: 'Job not found' });
+      }
+
       const fsrDoc = await getFsrDocumentByJobId(req.params.id);
       if (!fsrDoc) {
         return res.status(404).json({ success: false, error: 'No FSR document is attached to this job' });
@@ -1462,8 +1537,110 @@ router.patch(
 
       fsrDoc.levitonExternalLink = normalizeLevitonExternalLink(req.body.levitonExternalLink);
       await fsrDoc.save();
+
+      const recipientIds = [];
+
+      createNotification({
+        type: 'JOB_FSR_LINK_UPDATED',
+        message: `${actorWithRole(req.user)} updated the external Leviton FSR link for job "${job.title}".`,
+        jobId: job._id,
+        recipientIds: getVisibleFsrTechnicianRecipientIds(job, fsrDoc),
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        excludeUserId: req.user._id,
+      });
+
       broadcastJobUpdate();
       return res.json({ success: true, data: await attachAssetUrlsToFsrData(formatFsrDocument(fsrDoc)) });
+    } catch (error) {
+      const status = error.status || 500;
+      return res.status(status).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ── PATCH /api/jobs/:id/fsr/template ────────────────────────────────
+router.patch(
+  '/:id/fsr/template',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  [
+    body('templateKey')
+      .isString()
+      .custom((value) => Object.values(FSR_TEMPLATE).includes(value))
+      .withMessage('templateKey must be a valid FSR template'),
+    body('levitonExternalLink').optional().isString().withMessage('levitonExternalLink must be a string'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const job = await Job.findById(req.params.id)
+        .select(
+          '_id title address customer customerName companyName jobType programmingSubtype assignedTechnician secondaryAssignedTechnician status parentJob jobVisitKind'
+        )
+        .populate('customer', 'name address')
+        .populate('assignedTechnician', 'name email')
+        .populate('secondaryAssignedTechnician', 'name email')
+        .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
+      if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+
+      const fsrDoc = await getFsrDocumentByJobId(job._id);
+      if (!fsrDoc) {
+        return res.status(404).json({ success: false, error: 'No FSR document is attached to this job' });
+      }
+      if (fsrDoc.status === FSR_STATUS.SUBMITTED) {
+        return res.status(400).json({ success: false, error: 'Submitted FSRs are read-only' });
+      }
+
+      const nextTemplateKey = req.body.templateKey;
+      if (fsrDoc.templateKey === nextTemplateKey) {
+        return res.json({
+          success: true,
+          data: await buildFsrResponseData(job, fsrDoc),
+          meta: { changed: false },
+        });
+      }
+
+      const previousTemplateLabel = formatFsrDocument(fsrDoc).templateLabel;
+      const defaultTemplateKey = resolveFsrTemplateForJobType(job.jobType, {
+        programmingSubtype: job.programmingSubtype,
+      });
+
+      fsrDoc.templateKey = nextTemplateKey;
+      fsrDoc.templateSource =
+        nextTemplateKey === defaultTemplateKey
+          ? FSR_TEMPLATE_SOURCE.AUTO
+          : FSR_TEMPLATE_SOURCE.MANUAL_OVERRIDE;
+      fsrDoc.status = FSR_STATUS.NOT_STARTED;
+      fsrDoc.jobSnapshot = undefined;
+      fsrDoc.submissionData = undefined;
+      fsrDoc.assets = [];
+      fsrDoc.submittedBy = null;
+      fsrDoc.submittedAt = null;
+      fsrDoc.levitonExternalLink =
+        nextTemplateKey === FSR_TEMPLATE.LEVITON_EXTERNAL
+          ? normalizeLevitonExternalLink(req.body.levitonExternalLink)
+          : '';
+
+      await fsrDoc.save();
+
+      createNotification({
+        type: 'JOB_FSR_TEMPLATE_CHANGED',
+        message: `${actorWithRole(req.user)} changed the FSR for job "${job.title}" from ${previousTemplateLabel} to ${formatFsrDocument(fsrDoc).templateLabel}.`,
+        jobId: job._id,
+        recipientIds: getVisibleFsrTechnicianRecipientIds(job, fsrDoc),
+        recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+        excludeUserId: req.user._id,
+      });
+
+      broadcastJobUpdate();
+      return res.json({
+        success: true,
+        data: await buildFsrResponseData(job, fsrDoc),
+        meta: { changed: true },
+      });
     } catch (error) {
       const status = error.status || 500;
       return res.status(status).json({ success: false, error: error.message });
@@ -1499,6 +1676,12 @@ router.post(
       const fsrDoc = await getFsrDocumentByJobId(job._id);
       if (!fsrDoc) {
         return res.status(404).json({ success: false, error: 'No FSR document is attached to this job' });
+      }
+      if (!canUserOpenVisibleFsr(req.user, job, fsrDoc)) {
+        return res.status(403).json({
+          success: false,
+          error: 'This FSR will become available after you start the completion flow from Mark Completed.',
+        });
       }
       if (fsrDoc.status === FSR_STATUS.SUBMITTED) {
         return res.status(400).json({ success: false, error: 'Submitted FSRs are read-only' });
@@ -1568,6 +1751,12 @@ router.post(
       const fsrDoc = await getFsrDocumentByJobId(job._id);
       if (!fsrDoc) {
         return res.status(404).json({ success: false, error: 'No FSR document is attached to this job' });
+      }
+      if (!canUserOpenVisibleFsr(req.user, job, fsrDoc)) {
+        return res.status(403).json({
+          success: false,
+          error: 'This FSR will become available after you start the completion flow from Mark Completed.',
+        });
       }
       if (fsrDoc.status === FSR_STATUS.SUBMITTED) {
         return res.status(400).json({ success: false, error: 'This FSR has already been submitted' });
