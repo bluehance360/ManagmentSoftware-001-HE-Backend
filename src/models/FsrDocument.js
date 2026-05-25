@@ -86,6 +86,10 @@ const fsrDocumentSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    technicianVisibleAt: {
+      type: Date,
+      default: null,
+    },
     levitonExternalLink: {
       type: String,
       trim: true,

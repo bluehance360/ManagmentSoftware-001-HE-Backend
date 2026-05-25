@@ -9,10 +9,12 @@ Time-based job notifications, evaluated by a single in-process cron task.
 | **1 — Overdue assigned job** | A job has been `ASSIGNED` for **24+ hours** and is not yet `COMPLETED` | Admin, Office Manager, assigned technician, secondary technician |
 | **2 — Documents missing before schedule** | A not-yet-started job has missing required documents as its scheduled date approaches — reminders at **24h / 12h / 6h / 3h / 1h** before the scheduled time | Admin, Office Manager |
 | **3 — Started with pending documents** | A job is `IN_PROGRESS` but still has missing required documents | Admin, Office Manager |
+| **4 — FSR unsubmitted (tech reminder)** | FSR became visible to the technician but has not been submitted — reminders at **+12h**, then **every 24h** | Assigned technician, secondary technician |
+| **5 — FSR unsubmitted (admin/manager reminder)** | Same FSR condition, targeted at leadership — first at **next day 11:00 AM LA**, then **+12h** (11:00 PM), then **every 24h** | Admin, Office Manager |
 
 ## How it works
 
-A single [`node-cron`](https://www.npmjs.com/package/node-cron) task runs **every 30 minutes** (`*/30 * * * *`, timezone `America/Los_Angeles`). On each tick it runs all three checks. Each check scans the relevant jobs, decides which notifications are due, and sends them through the existing `createNotification()` pipeline (in-app + Socket.io + Web Push).
+A single [`node-cron`](https://www.npmjs.com/package/node-cron) task runs **every 30 minutes** (`*/30 * * * *`, timezone `America/Los_Angeles`). On each tick it runs all five checks. Each check scans the relevant jobs/FSR documents, decides which notifications are due, and sends them through the existing `createNotification()` pipeline (in-app + Socket.io + Web Push).
 
 The scheduler is registered in [`src/server.js`](../src/server.js) via `notificationScheduler.start()` immediately after `connectDB()`. Registration is synchronous; the first tick is 30 minutes out, by which point the DB is connected.
 
@@ -20,9 +22,10 @@ The scheduler is registered in [`src/server.js`](../src/server.js) via `notifica
 
 | File | Purpose |
 |------|---------|
-| `src/services/SchedulerService.js` | The cron task and all three rule implementations |
+| `src/services/SchedulerService.js` | The cron task, all five rule implementations, and notification format helpers |
 | `src/models/NotificationLog.js` | Deduplication ledger (one row per sent notification) |
-| `src/models/Notification.js` | Added 3 enum types: `JOB_OVERDUE_INCOMPLETE`, `JOB_DOCS_MISSING_REMINDER`, `JOB_STARTED_DOCS_PENDING` |
+| `src/models/Notification.js` | Enum types including `JOB_FSR_REMINDER_TECH`, `JOB_FSR_REMINDER_ADMIN` |
+| `src/models/FsrDocument.js` | Added `technicianVisibleAt` field — the FSR reminder clock starts here |
 | `src/scripts/runNotificationChecks.js` | Manual on-demand trigger (`pnpm run notify:check`) |
 | `src/server.js` | Starts the scheduler on boot |
 
@@ -41,6 +44,8 @@ This makes the system safe across server restarts and overlapping ticks: the led
 | 1 | `OVERDUE_24H` | assignment timestamp (ISO) | **Reassigning a job resets the 24h clock.** A reassignment pushes a new `ASSIGNED` entry into `statusHistory`; the scheduler measures from the *latest* one, producing a new `ref`, so the new technician's 24h window is tracked independently. |
 | 2 | `DOC_REMINDER_24H` … `DOC_REMINDER_1H` | the job's `scheduledDate` | **Rescheduling a job re-arms all 5 reminders** for the new date. |
 | 3 | `DOC_STARTED_PENDING` | `''` (empty) | Fires exactly once per job. |
+| 4 | `FSR_TECH_REMINDER` | ISO timestamp of the exact due instant | **Each checkpoint is independently deduplicated.** If the FSR is hidden and re-revealed (e.g. admin reverts the job), `technicianVisibleAt` is updated and an entirely new set of checkpoints fires. |
+| 5 | `FSR_ADMIN_REMINDER` | ISO timestamp of the exact due instant | Same reset behaviour as Rule 4 — reverts that clear `technicianVisible` restart the admin clock too. |
 
 ## Scheduled-time assumption & timezone
 
@@ -143,6 +148,51 @@ This runs all three checks once against the live DB and prints how many notifica
 3. Run `pnpm run notify:check` → expect **Rule 3 = 1**.
 4. Verify admin + manager received `JOB_STARTED_DOCS_PENDING` (technicians should **not**).
 5. Upload the missing document, run again → **Rule 3 = 0** (already fired once; and now nothing is missing anyway).
+
+### Rule 4 — FSR tech reminder
+
+1. Create a programming job, assign a technician, and move the job to `IN_PROGRESS`.
+2. The technician opens the FSR → `technicianVisible: true` and `technicianVisibleAt` are set.
+3. Back-date `technicianVisibleAt` by **13+ hours** in MongoDB:
+   ```js
+   db.fsrdocuments.updateOne(
+     { job: ObjectId("<jobId>") },
+     { $set: { technicianVisibleAt: new Date(Date.now() - 13*3600*1000) } }
+   )
+   ```
+4. Run `pnpm run notify:check` → expect **Rule 4 = 1**.
+5. Verify the assigned technician received `JOB_FSR_REMINDER_TECH`.
+6. Run again → **Rule 4 = 0** (deduped).
+7. **Reset / re-arm:** delete the ledger row and back-date by 25+ hours to test the 24h repeat:
+   ```js
+   db.notificationlogs.deleteMany({ job: ObjectId("<jobId>"), type: "FSR_TECH_REMINDER" })
+   db.fsrdocuments.updateOne(
+     { job: ObjectId("<jobId>") },
+     { $set: { technicianVisibleAt: new Date(Date.now() - 25*3600*1000) } }
+   )
+   ```
+8. Verify the technician clock resets when the job is reverted (admin undoes IN_PROGRESS → ASSIGNED): `technicianVisible` is cleared, the FSR is excluded from the query, and no more reminders fire until the tech re-opens the FSR.
+
+### Rule 5 — FSR admin/manager reminder
+
+1. Same setup as Rule 4.
+2. Set `technicianVisibleAt` to **yesterday at any time before 11:00 AM LA** so the "next day 11 AM" window has passed:
+   ```js
+   db.fsrdocuments.updateOne(
+     { job: ObjectId("<jobId>") },
+     { $set: { technicianVisibleAt: new Date(Date.now() - 25*3600*1000) } }
+   )
+   ```
+   (Adjust the offset so the computed `nextDayAtAdminHourUtc` falls inside the current 35-minute window.)
+3. Run `pnpm run notify:check` → expect **Rule 5 = 1**.
+4. Verify admin + manager received `JOB_FSR_REMINDER_ADMIN` (technicians should **not**).
+5. Run again → **Rule 5 = 0** (deduped).
+
+> **Tip:** verify the admin reminder time math:
+> ```bash
+> node -e "console.log(require('./src/services/SchedulerService').nextDayAtAdminHourUtc(new Date()).toISOString())"
+> # => UTC instant for 11:00 AM LA tomorrow
+> ```
 
 ### Verifying the live cron
 

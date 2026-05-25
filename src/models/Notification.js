@@ -41,6 +41,8 @@ const notificationSchema = new mongoose.Schema(
         'JOB_OVERDUE_INCOMPLETE',
         'JOB_DOCS_MISSING_REMINDER',
         'JOB_STARTED_DOCS_PENDING',
+        'JOB_FSR_REMINDER_TECH',
+        'JOB_FSR_REMINDER_ADMIN',
         'TEAM_MEMBER_JOINED',
         'TECH_TIMEOUT',
         'TECH_TIMEOUT_REQUESTED',

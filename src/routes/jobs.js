@@ -1690,26 +1690,19 @@ router.post('/:id/fsr/open', async (req, res) => {
       return res.status(404).json({ success: false, error: 'No FSR document is attached to this job' });
     }
 
-    const revealForTechnicianCompletion = Boolean(req.body?.revealForTechnicianCompletion);
     let technicianVisibleUnlocked = false;
 
     if (req.user.role === ROLES.TECHNICIAN && !fsrDoc.technicianVisible) {
-      if (!revealForTechnicianCompletion) {
+      if (job.status !== JOB_STATUS.IN_PROGRESS) {
         return res.status(403).json({
           success: false,
-          error: 'This FSR will become available after you start the completion flow from Mark Completed.',
-        });
-      }
-      if (job.status !== JOB_STATUS.IN_PROGRESS) {
-        return res.status(400).json({
-          success: false,
-          error: 'This FSR can only be started from the completion flow while the job is in progress.',
+          error: 'The FSR is only accessible while the job is in progress.',
         });
       }
 
       const unlockedDoc = await FsrDocument.findOneAndUpdate(
         { job: job._id, technicianVisible: { $ne: true } },
-        { $set: { technicianVisible: true } },
+        { $set: { technicianVisible: true, technicianVisibleAt: new Date() } },
         { new: true }
       );
       technicianVisibleUnlocked = Boolean(unlockedDoc);
@@ -1719,7 +1712,7 @@ router.post('/:id/fsr/open', async (req, res) => {
     if (!canUserOpenVisibleFsr(req.user, job, fsrDoc)) {
       return res.status(403).json({
         success: false,
-        error: 'This FSR will become available after you start the completion flow from Mark Completed.',
+        error: 'Not authorized to open this FSR.',
       });
     }
 
@@ -3670,6 +3663,16 @@ router.patch(
       }
 
       const job = result.data;
+
+      // Reverting from IN_PROGRESS hides the FSR from the technician again
+      // (unless already submitted — a submitted FSR should remain visible)
+      if (result.revertedFrom === JOB_STATUS.IN_PROGRESS) {
+        await FsrDocument.updateOne(
+          { job: job._id, status: { $ne: FSR_STATUS.SUBMITTED } },
+          { $set: { technicianVisible: false } }
+        );
+      }
+
       const message = `Job "${job.title}" status reverted from ${result.revertedFrom} to ${result.revertedTo} by ${actorWithRole(req.user)}`;
       const previousAssignedTechId = beforeRevertJob?.assignedTechnician?.toString();
       const previousSecondaryAssignedTechId = beforeRevertJob?.secondaryAssignedTechnician?.toString();
@@ -3751,13 +3754,20 @@ router.delete(
       const secondaryTechId = job.secondaryAssignedTechnician?._id;
       const fsrDoc = await getFsrDocumentByJobId(req.params.id);
 
+      const s3Keys = [
+        ...(fsrDoc?.assets || []).filter((a) => a?.key).map((a) => a.key),
+        ...(job.documents || []).filter((d) => d?.key).map((d) => d.key),
+        ...(job.assignmentDocumentRequirements || [])
+          .filter((r) => r?.document?.key)
+          .map((r) => r.document.key),
+      ];
+
       await Job.findByIdAndDelete(req.params.id);
+
+      if (s3Keys.length) {
+        await Promise.all(s3Keys.map((key) => deleteObject(key).catch(() => null)));
+      }
       if (fsrDoc) {
-        await Promise.all(
-          (fsrDoc.assets || [])
-            .filter((asset) => asset?.key)
-            .map((asset) => deleteObject(asset.key).catch(() => null))
-        );
         await fsrDoc.deleteOne();
       }
 

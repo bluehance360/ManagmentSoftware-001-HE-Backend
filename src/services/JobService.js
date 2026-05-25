@@ -236,11 +236,7 @@ async function transitionStatus(jobId, newStatus, user, notes) {
     }
   }
 
-  if (
-    user.role === ROLES.TECHNICIAN &&
-    currentStatus === JOB_STATUS.IN_PROGRESS &&
-    newStatus === JOB_STATUS.COMPLETED
-  ) {
+  if (currentStatus === JOB_STATUS.IN_PROGRESS && newStatus === JOB_STATUS.COMPLETED) {
     const fsrDoc = await getFsrDocumentByJobId(jobId);
     if (fsrDoc && fsrDoc.status !== FSR_STATUS.SUBMITTED) {
       return {
