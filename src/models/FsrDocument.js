@@ -86,6 +86,10 @@ const fsrDocumentSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    technicianVisibleAt: {
+      type: Date,
+      default: null,
+    },
     levitonExternalLink: {
       type: String,
       trim: true,
@@ -98,6 +102,10 @@ const fsrDocumentSchema = new mongoose.Schema(
     submissionData: {
       type: mongoose.Schema.Types.Mixed,
       default: undefined,
+    },
+    draftSignatures: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
     },
     assets: {
       type: [fsrAssetSchema],

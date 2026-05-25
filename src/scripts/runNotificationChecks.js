@@ -35,6 +35,8 @@ const scheduler = require('../services/SchedulerService');
     console.log(`  Rule 1  overdue assigned jobs:        ${result.overdue}`);
     console.log(`  Rule 2  missing-document reminders:   ${result.docReminders}`);
     console.log(`  Rule 3  started w/ pending documents: ${result.startedPendingDocs}`);
+    console.log(`  Rule 4  FSR unsubmitted — tech:       ${result.fsrTechReminders}`);
+    console.log(`  Rule 5  FSR unsubmitted — admin/mgr:  ${result.fsrAdminReminders}`);
 
     await mongoose.disconnect();
     process.exit(0);

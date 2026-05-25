@@ -1,4 +1,5 @@
 const FsrDocument = require('../models/FsrDocument');
+const FsrSignatureRequest = require('../models/FsrSignatureRequest');
 const { toLocalDateOnly } = require('../utils/dateOnly');
 
 const FSR_TEMPLATE = {
@@ -143,13 +144,19 @@ async function syncUnsubmittedFsrDocumentForJob(jobDoc, opts = {}) {
 
   const nextTemplateKey =
     doc.templateSource === FSR_TEMPLATE_SOURCE.MANUAL_OVERRIDE ? doc.templateKey : defaultTemplateKey;
+  const templateChanged = doc.templateKey !== nextTemplateKey;
   if (!nextTemplateKey) {
+    await FsrSignatureRequest.updateMany(
+      { fsrDocument: doc._id, status: 'PENDING' },
+      { $set: { status: 'CANCELLED' } }
+    );
     await doc.deleteOne();
     return null;
   }
   doc.templateKey = nextTemplateKey;
   doc.status = FSR_STATUS.NOT_STARTED;
   doc.submissionData = undefined;
+  doc.draftSignatures = {};
   doc.jobSnapshot = undefined;
   doc.assets = [];
   doc.submittedBy = null;
@@ -162,6 +169,12 @@ async function syncUnsubmittedFsrDocumentForJob(jobDoc, opts = {}) {
       : '';
 
   await doc.save();
+  if (templateChanged) {
+    await FsrSignatureRequest.updateMany(
+      { fsrDocument: doc._id, status: 'PENDING' },
+      { $set: { status: 'CANCELLED' } }
+    );
+  }
   return doc;
 }
 

@@ -10,6 +10,19 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+function getFrontendUrl() {
+  return process.env.CORS_ORIGIN.split(',')[0] || 'http://localhost:5173';
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 /**
  * Send an invitation email with a link to create an account.
  * @param {Object} opts
@@ -19,7 +32,7 @@ const transporter = nodemailer.createTransport({
  * @param {string} opts.invitedByName - Name of the admin who invited
  */
 async function sendInvitationEmail({ to, role, token, invitedByName }) {
-  const frontendUrl = process.env.CORS_ORIGIN.split(',')[0] || 'http://localhost:5173';
+  const frontendUrl = getFrontendUrl();
   const acceptUrl = `${frontendUrl}/accept-invite?token=${token}`;
 
   const roleLabelMap = {
@@ -274,4 +287,114 @@ async function sendOtpEmail({ to, code }) {
   });
 }
 
-module.exports = { sendInvitationEmail, sendAccountDeletedEmail, sendInviteRevokedEmail, sendOtpEmail };
+async function sendFsrSignatureRequestEmail({
+  to,
+  token,
+  signatureFieldLabel,
+  signatureSectionLabel,
+  requestedByName,
+  requestedByRole,
+  jobTitle,
+  siteAddress,
+  companyName,
+  customerName,
+  expiresAt,
+}) {
+  const frontendUrl = getFrontendUrl();
+  const signingUrl = `${frontendUrl}/fsr-signature/${token}`;
+  const roleLabel = requestedByRole === 'OFFICE_MANAGER'
+    ? 'Office Manager'
+    : requestedByRole === 'ADMIN'
+      ? 'Administrator'
+      : requestedByRole || 'Team Member';
+  const summaryRows = [
+    ['Requested signature', signatureFieldLabel],
+    ['Section', signatureSectionLabel],
+    ['Job / Project', jobTitle],
+    ['Site address', siteAddress],
+    ['Company / Customer', [companyName, customerName].filter(Boolean).join(' / ')],
+    ['Requested by', `${requestedByName} (${roleLabel})`],
+    ['Link expires', expiresAt ? new Date(expiresAt).toLocaleString('en-US') : '7 days'],
+  ].filter(([, value]) => String(value || '').trim());
+
+  const rowsHtml = summaryRows
+    .map(
+      ([label, value]) => `
+        <tr>
+          <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;color:#6b7280;font-size:13px;font-weight:600;white-space:nowrap;">${escapeHtml(label)}</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;color:#111827;font-size:13px;">${escapeHtml(value)}</td>
+        </tr>`
+    )
+    .join('');
+
+  const html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+</head>
+<body style="margin:0;padding:0;background-color:#f4f4f5;font-family:Arial,Helvetica,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f5;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <table width="560" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+          <tr>
+            <td style="background-color:#C41E2A;padding:28px 32px;text-align:center;">
+              <h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:700;">Hosanna Electric</h1>
+              <p style="margin:6px 0 0;color:#fecaca;font-size:13px;">Field Service Report Signature Request</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:32px;">
+              <h2 style="margin:0 0 8px;color:#1a1a1a;font-size:18px;">Signature requested</h2>
+              <p style="margin:0 0 20px;color:#6b7280;font-size:14px;line-height:1.6;">
+                <strong>${escapeHtml(requestedByName)}</strong> from <strong>Hosanna Electric</strong> requested your
+                signature for the field service report below.
+              </p>
+              <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;border-collapse:separate;border-spacing:0;">
+                ${rowsHtml}
+              </table>
+              <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:24px;">
+                <tr>
+                  <td align="center">
+                    <a href="${signingUrl}" target="_blank"
+                      style="display:inline-block;padding:14px 32px;background-color:#C41E2A;color:#ffffff;text-decoration:none;font-size:15px;font-weight:600;border-radius:8px;">
+                      Open Signature Pad
+                    </a>
+                  </td>
+                </tr>
+              </table>
+              <p style="margin:24px 0 0;color:#9ca3af;font-size:12px;line-height:1.5;text-align:center;">
+                If the button doesn't work, copy and paste this link into your browser:<br/>
+                <a href="${signingUrl}" style="color:#C41E2A;word-break:break-all;">${signingUrl}</a>
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="background-color:#f9fafb;padding:20px 32px;border-top:1px solid #e5e7eb;text-align:center;">
+              <p style="margin:0;color:#9ca3af;font-size:11px;">&copy; ${new Date().getFullYear()} Hosanna Electric. All rights reserved.</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+
+  await transporter.sendMail({
+    from: `"${process.env.SMTP_FROM_NAME || 'Hosanna Electric'}" <${process.env.SMTP_FROM_EMAIL || 'noreply@example.com'}>`,
+    to,
+    subject: `Signature requested: ${signatureFieldLabel} for ${jobTitle}`,
+    html,
+  });
+}
+
+module.exports = {
+  sendInvitationEmail,
+  sendAccountDeletedEmail,
+  sendInviteRevokedEmail,
+  sendOtpEmail,
+  sendFsrSignatureRequestEmail,
+};

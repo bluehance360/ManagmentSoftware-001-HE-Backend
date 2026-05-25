@@ -22,9 +22,11 @@
 
 const cron = require('node-cron');
 const Job = require('../models/Job');
+const FsrDocument = require('../models/FsrDocument');
 const NotificationLog = require('../models/NotificationLog');
 const { createNotification } = require('./NotificationService');
 const { JOB_STATUS, ROLES } = require('../config/constants');
+const { FSR_STATUS } = require('./FsrService');
 
 // ── Configuration ──────────────────────────────────────────────────
 const TIMEZONE = 'America/Los_Angeles';
@@ -37,6 +39,13 @@ const DOC_REMINDER_THRESHOLDS = [24, 12, 6, 3, 1]; // hours before scheduled tim
 // it is only sent once.
 const REMINDER_WINDOW_MS = 35 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
+
+// FSR reminder schedule (Rules 4 & 5)
+// Tech  : first at +12h after FSR visibility, then every 24h.
+// Admin : first at 11:00 AM LA on the *next calendar day* after visibility,
+//         then +12h (= 11:00 PM that same day), then every 24h from there.
+const FSR_TECH_FIRST_REMINDER_HOURS = 12;
+const FSR_ADMIN_REMINDER_HOUR_LOCAL = 11; // 11:00 AM LA for the first admin reminder
 
 // ── Timezone helpers ───────────────────────────────────────────────
 
@@ -131,6 +140,135 @@ async function claimNotification(jobId, type, ref = '') {
     if (err && err.code === 11000) return false; // duplicate key — already sent
     throw err;
   }
+}
+
+// ── Notification Format Helpers ────────────────────────────────────
+//
+// Centralised payload builders for all scheduler-issued notifications.
+// Every builder calls buildScheduledPayload() so the shape is always
+// consistent. To add a new scheduled notification:
+//   1. Add its type to src/models/Notification.js enum.
+//   2. Add a builder function here.
+//   3. Call claimNotification() + createNotification(build…()) in the rule.
+
+/**
+ * Core builder — every scheduler notification goes through this so the
+ * structure (type, message, jobId, optional ids/roles, optional dedupeKey)
+ * is always consistent.
+ */
+function buildScheduledPayload({ type, message, jobId, recipientIds = [], recipientRoles = [], dedupeKey }) {
+  const payload = { type, message, jobId };
+  const ids = recipientIds.filter(Boolean);
+  if (ids.length) payload.recipientIds = ids;
+  if (recipientRoles.length) payload.recipientRoles = recipientRoles;
+  if (dedupeKey) payload.dedupeKey = dedupeKey;
+  return payload;
+}
+
+/** Rule 4 — FSR tech reminder: sent to the assigned technician(s). */
+function buildFsrTechReminderPayload(job, hoursElapsed, dedupeKey) {
+  return buildScheduledPayload({
+    type: 'JOB_FSR_REMINDER_TECH',
+    message: `Reminder: The FSR for job "${job.title}" has been open for over ${hoursElapsed} hours and has not been submitted yet.`,
+    jobId: job._id,
+    recipientIds: [job.assignedTechnician, job.secondaryAssignedTechnician],
+    dedupeKey,
+  });
+}
+
+/** Rule 5 — FSR admin/manager reminder: broadcast to Admin + Office Manager roles. */
+function buildFsrAdminReminderPayload(job, dedupeKey) {
+  return buildScheduledPayload({
+    type: 'JOB_FSR_REMINDER_ADMIN',
+    message: `Reminder: The FSR for job "${job.title}" has not been submitted. Please follow up with the assigned technician.`,
+    jobId: job._id,
+    recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+    dedupeKey,
+  });
+}
+
+// ── FSR reminder timing helpers ────────────────────────────────────
+
+/**
+ * Returns the UTC instant for FSR_ADMIN_REMINDER_HOUR_LOCAL on the *next*
+ * calendar day (in America/Los_Angeles) after `fromDate`.
+ * Reuses getTimezoneOffsetMs for DST-correct conversion.
+ */
+function nextDayAtAdminHourUtc(fromDate) {
+  // Determine the LA local date for fromDate
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: TIMEZONE,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  });
+  const parts = {};
+  for (const p of dtf.formatToParts(fromDate)) parts[p.type] = p.value;
+
+  // Advance by one calendar day (safe across month / year boundaries)
+  const laDateMs = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day));
+  const nextDayStr = new Date(laDateMs + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+  const [y, mo, d] = nextDayStr.split('-').map(Number);
+  // Use ~midday UTC as the DST reference (same pattern as scheduledStartUtc)
+  const reference = new Date(Date.UTC(y, mo - 1, d, 20, 0, 0));
+  const offsetMs = getTimezoneOffsetMs(TIMEZONE, reference);
+  return new Date(Date.UTC(y, mo - 1, d, FSR_ADMIN_REMINDER_HOUR_LOCAL, 0, 0) - offsetMs);
+}
+
+/**
+ * Returns the due-time checkpoints (if any) that fall inside the current
+ * 35-minute reminder window for the tech FSR reminder schedule:
+ *   first at visibleAt + 12h, then every 24h.
+ * Each entry is { dueMs, hoursElapsed } — at most one per tick.
+ */
+function getFsrTechCheckpoints(visibleAt, now) {
+  const vMs = visibleAt.getTime();
+
+  // First reminder: T + 12h
+  const due12h = vMs + FSR_TECH_FIRST_REMINDER_HOURS * HOUR_MS;
+  if (now >= due12h && now < due12h + REMINDER_WINDOW_MS) {
+    return [{ dueMs: due12h, hoursElapsed: FSR_TECH_FIRST_REMINDER_HOURS }];
+  }
+
+  // Subsequent: every 24h starting at T + 24h.
+  // Math.floor gives the current 24h round (1 = 24-48h, 2 = 48-72h, …).
+  const elapsedMs = now - vMs;
+  if (elapsedMs >= 24 * HOUR_MS) {
+    const round = Math.floor(elapsedMs / (24 * HOUR_MS));
+    const dueMs = vMs + round * 24 * HOUR_MS;
+    if (now >= dueMs && now < dueMs + REMINDER_WINDOW_MS) {
+      return [{ dueMs, hoursElapsed: round * 24 }];
+    }
+  }
+
+  return [];
+}
+
+/**
+ * Returns the due-time checkpoints (if any) that fall inside the current
+ * 35-minute reminder window for the admin FSR reminder schedule:
+ *   first at next-day 11:00 AM LA, then +12h, then every 24h.
+ * Each entry is { dueMs } — at most one per tick.
+ */
+function getFsrAdminCheckpoints(visibleAt, now) {
+  const firstDueMs = nextDayAtAdminHourUtc(visibleAt).getTime();
+
+  // First reminder (next day at 11 AM LA)
+  if (now >= firstDueMs && now < firstDueMs + REMINDER_WINDOW_MS) {
+    return [{ dueMs: firstDueMs }];
+  }
+
+  // Second reminder: +12h from first (= 11 PM same day)
+  // Third+: every 24h from that 11 PM mark.
+  const baseDueMs = firstDueMs + 12 * HOUR_MS;
+  if (now >= baseDueMs) {
+    const round = Math.floor((now - baseDueMs) / (24 * HOUR_MS)); // 0, 1, 2, …
+    const dueMs = baseDueMs + round * 24 * HOUR_MS;
+    if (now >= dueMs && now < dueMs + REMINDER_WINDOW_MS) {
+      return [{ dueMs }];
+    }
+  }
+
+  return [];
 }
 
 // ── Rule 1: assigned but not completed within 24h ──────────────────
@@ -241,6 +379,83 @@ async function checkStartedJobsWithPendingDocuments() {
   return sent;
 }
 
+// ── Rule 4: FSR visible but not submitted — remind tech ────────────
+//
+// Fires for every IN_PROGRESS job whose FSR is visible to the technician
+// (technicianVisible: true) but has not been submitted yet.
+//
+// Schedule: +12h after visibility, then every 24h (+24h, +48h, …).
+// Recipients: assigned technician + secondary technician.
+async function checkFsrTechReminders() {
+  const fsrDocs = await FsrDocument.find({
+    technicianVisible: true,
+    technicianVisibleAt: { $exists: true, $ne: null },
+    status: { $ne: FSR_STATUS.SUBMITTED },
+  })
+    .select('_id job technicianVisibleAt')
+    .populate('job', '_id title status assignedTechnician secondaryAssignedTechnician');
+
+  const now = Date.now();
+  let sent = 0;
+
+  for (const fsrDoc of fsrDocs) {
+    const job = fsrDoc.job;
+    if (!job || job.status !== JOB_STATUS.IN_PROGRESS) continue;
+    if (!job.assignedTechnician) continue;
+
+    const checkpoints = getFsrTechCheckpoints(fsrDoc.technicianVisibleAt, now);
+    for (const { dueMs, hoursElapsed } of checkpoints) {
+      const ref = new Date(dueMs).toISOString();
+      const claimed = await claimNotification(job._id, 'FSR_TECH_REMINDER', ref);
+      if (!claimed) continue;
+
+      const dedupeKey = `fsr-tech-reminder:${job._id}:${ref}`;
+      await createNotification(buildFsrTechReminderPayload(job, hoursElapsed, dedupeKey));
+      sent += 1;
+    }
+  }
+
+  return sent;
+}
+
+// ── Rule 5: FSR visible but not submitted — remind admin/manager ───
+//
+// Fires for the same unsubmitted-FSR set as Rule 4, but targets Admins and
+// Office Managers instead of the technician.
+//
+// Schedule: next calendar day at 11:00 AM LA, then +12h (11:00 PM), then
+//           every 24h.
+async function checkFsrAdminReminders() {
+  const fsrDocs = await FsrDocument.find({
+    technicianVisible: true,
+    technicianVisibleAt: { $exists: true, $ne: null },
+    status: { $ne: FSR_STATUS.SUBMITTED },
+  })
+    .select('_id job technicianVisibleAt')
+    .populate('job', '_id title status assignedTechnician');
+
+  const now = Date.now();
+  let sent = 0;
+
+  for (const fsrDoc of fsrDocs) {
+    const job = fsrDoc.job;
+    if (!job || job.status !== JOB_STATUS.IN_PROGRESS) continue;
+
+    const checkpoints = getFsrAdminCheckpoints(fsrDoc.technicianVisibleAt, now);
+    for (const { dueMs } of checkpoints) {
+      const ref = new Date(dueMs).toISOString();
+      const claimed = await claimNotification(job._id, 'FSR_ADMIN_REMINDER', ref);
+      if (!claimed) continue;
+
+      const dedupeKey = `fsr-admin-reminder:${job._id}:${ref}`;
+      await createNotification(buildFsrAdminReminderPayload(job, dedupeKey));
+      sent += 1;
+    }
+  }
+
+  return sent;
+}
+
 // ── Runner ─────────────────────────────────────────────────────────
 
 /**
@@ -248,7 +463,13 @@ async function checkStartedJobsWithPendingDocuments() {
  * others. Returns a per-rule count of notifications sent (useful for testing).
  */
 async function runAllChecks() {
-  const result = { overdue: 0, docReminders: 0, startedPendingDocs: 0 };
+  const result = {
+    overdue: 0,
+    docReminders: 0,
+    startedPendingDocs: 0,
+    fsrTechReminders: 0,
+    fsrAdminReminders: 0,
+  };
 
   try {
     result.overdue = await checkOverdueAssignedJobs();
@@ -264,6 +485,16 @@ async function runAllChecks() {
     result.startedPendingDocs = await checkStartedJobsWithPendingDocuments();
   } catch (err) {
     console.error('[Scheduler] checkStartedJobsWithPendingDocuments failed:', err.message);
+  }
+  try {
+    result.fsrTechReminders = await checkFsrTechReminders();
+  } catch (err) {
+    console.error('[Scheduler] checkFsrTechReminders failed:', err.message);
+  }
+  try {
+    result.fsrAdminReminders = await checkFsrAdminReminders();
+  } catch (err) {
+    console.error('[Scheduler] checkFsrAdminReminders failed:', err.message);
   }
 
   return result;
@@ -301,10 +532,15 @@ module.exports = {
   checkOverdueAssignedJobs,
   checkMissingDocumentReminders,
   checkStartedJobsWithPendingDocuments,
+  checkFsrTechReminders,
+  checkFsrAdminReminders,
   scheduledStartUtc,
+  nextDayAtAdminHourUtc,
   getTimezoneOffsetMs,
   jobHasMissingRequiredDocuments,
   lastAssignedAt,
+  getFsrTechCheckpoints,
+  getFsrAdminCheckpoints,
   CRON_EXPRESSION,
   TIMEZONE,
 };
