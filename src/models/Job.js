@@ -68,6 +68,10 @@ const documentSchema = new mongoose.Schema(
       trim: true,
       default: '',
     },
+    isSiteInfo: {
+      type: Boolean,
+      default: false,
+    },
     uploadedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
@@ -203,6 +207,19 @@ const jobSchema = new mongoose.Schema(
     address: {
       type: String,
       trim: true,
+    },
+    // ── Job-site info (shown to technicians in place of the customer address) ──
+    // TEXT  → siteInfoText is shown.
+    // PDF   → documents flagged isSiteInfo are shown.
+    siteInfoMode: {
+      type: String,
+      enum: ['TEXT', 'PDF'],
+      default: 'TEXT',
+    },
+    siteInfoText: {
+      type: String,
+      trim: true,
+      default: '',
     },
     scheduledDate: {
       type: String,

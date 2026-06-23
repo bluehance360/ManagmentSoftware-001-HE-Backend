@@ -177,6 +177,13 @@ async function createJob(data, userId) {
   if (data.companyName) {
     jobData.companyName = data.companyName;
   }
+  // Job-site info (text or PDF mode)
+  if (data.siteInfoMode === 'PDF' || data.siteInfoMode === 'TEXT') {
+    jobData.siteInfoMode = data.siteInfoMode;
+  }
+  if (typeof data.siteInfoText === 'string') {
+    jobData.siteInfoText = data.siteInfoText.trim();
+  }
   // Legacy fields (backward compat for old jobs)
   if (data.customerName) jobData.customerName = data.customerName;
   if (data.customerPhone) jobData.customerPhone = data.customerPhone;
