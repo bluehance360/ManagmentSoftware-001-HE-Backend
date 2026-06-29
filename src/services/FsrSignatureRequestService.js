@@ -14,6 +14,8 @@ const FSR_SIGNATURE_FIELD_KEY = {
   STANDARD_CLIENT_ACCEPTANCE: 'standard.clientAcceptance.acceptorSignature',
   WATTSTOPPER_TRAINING: 'wattstopper.training.traineeSignature',
   WATTSTOPPER_FINAL: 'wattstopper.reportReceivedBy.signature',
+  KORE_ELECTRICAL: 'kore.electricalContractor.signature',
+  KORE_OWNER: 'kore.ownerRepresentative.signature',
 };
 
 const SIGNATURE_REQUEST_DEFINITIONS = {
@@ -57,6 +59,20 @@ const SIGNATURE_REQUEST_DEFINITIONS = {
       { key: 'title', label: 'Title' },
       { key: 'company', label: 'Company' },
     ],
+  },
+  [FSR_SIGNATURE_FIELD_KEY.KORE_ELECTRICAL]: {
+    key: FSR_SIGNATURE_FIELD_KEY.KORE_ELECTRICAL,
+    templateKey: FSR_TEMPLATE.KORE,
+    label: 'Electrical Contractor Signature',
+    sectionLabel: 'Sign-Off',
+    contextFields: [{ key: 'name', label: 'Electrical Contractor Name' }],
+  },
+  [FSR_SIGNATURE_FIELD_KEY.KORE_OWNER]: {
+    key: FSR_SIGNATURE_FIELD_KEY.KORE_OWNER,
+    templateKey: FSR_TEMPLATE.KORE,
+    label: "Owner's Representative Signature",
+    sectionLabel: 'Sign-Off',
+    contextFields: [{ key: 'name', label: "Owner's Representative Name" }],
   },
 };
 

@@ -35,6 +35,24 @@ function sanitizeFileName(name = '') {
     .slice(0, 140) || 'document';
 }
 
+const MIME_BY_EXT = {
+  pdf: 'application/pdf',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  svg: 'image/svg+xml',
+  txt: 'text/plain; charset=utf-8',
+  csv: 'text/csv; charset=utf-8',
+  xml: 'application/xml',
+};
+
+function mimeFromName(name = '') {
+  const ext = String(name).split('.').pop().toLowerCase();
+  return MIME_BY_EXT[ext] || '';
+}
+
 function buildDocumentKey(jobId, originalName) {
   const safeName = sanitizeFileName(originalName);
   const stamp = Date.now();
@@ -66,12 +84,18 @@ async function getUploadUrl({ key, contentType, expiresIn = 300 }) {
   return getSignedUrl(s3, command, { expiresIn });
 }
 
-async function getDownloadUrl({ key, fileName, expiresIn = 900 }) {
+async function getDownloadUrl({ key, fileName, contentType, expiresIn = 900 }) {
   ensureS3Config();
+  const inferred = mimeFromName(fileName);
+  const resolvedType =
+    contentType && contentType !== 'application/octet-stream'
+      ? contentType
+      : inferred || contentType || undefined;
   const command = new GetObjectCommand({
     Bucket: BUCKET,
     Key: key,
     ResponseContentDisposition: `inline; filename="${sanitizeFileName(fileName)}"`,
+    ...(resolvedType ? { ResponseContentType: resolvedType } : {}),
   });
   return getSignedUrl(s3, command, { expiresIn });
 }

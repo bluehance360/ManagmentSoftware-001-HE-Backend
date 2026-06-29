@@ -160,6 +160,7 @@ async function createJob(data, userId) {
     notes: data.notes,
     createdBy: userId,
     status: JOB_STATUS.TENTATIVE,
+    statusSeenBy: [userId],
     statusHistory: [
       {
         fromStatus: null,
@@ -176,6 +177,13 @@ async function createJob(data, userId) {
   }
   if (data.companyName) {
     jobData.companyName = data.companyName;
+  }
+  // Job-site info (text or PDF mode)
+  if (data.siteInfoMode === 'PDF' || data.siteInfoMode === 'TEXT') {
+    jobData.siteInfoMode = data.siteInfoMode;
+  }
+  if (typeof data.siteInfoText === 'string') {
+    jobData.siteInfoText = data.siteInfoText.trim();
   }
   // Legacy fields (backward compat for old jobs)
   if (data.customerName) jobData.customerName = data.customerName;

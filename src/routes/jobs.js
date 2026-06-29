@@ -74,6 +74,7 @@ const EMPTY_PROGRAMMING_REQUIREMENT_DEFAULTS = {
 };
 const FSR_IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'heic', 'heif']);
 const FSR_MAX_ASSETS = 10;
+const KORE_SYSTEM_STATUSES = ['VERIFIED_ACCEPTED', 'CONFIRMATION', 'CONDITIONAL'];
 
 function normalizeJobType(value) {
   return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
@@ -449,7 +450,86 @@ async function buildSubmissionPayloadForFsr({ fsrDoc, submissionData, job, userI
     };
   }
 
+  if (fsrDoc.templateKey === FSR_TEMPLATE.KORE) {
+    const systemStatus = trimString(payload.systemStatus);
+    if (!KORE_SYSTEM_STATUSES.includes(systemStatus)) {
+      throwBadRequest('A system status selection is required');
+    }
+
+    const electricalName = trimString(payload.electricalContractor?.name);
+    const electricalSignature = electricalName
+      ? resolveSubmittedOrDraftSignature(
+          fsrDoc,
+          payload.electricalContractor?.signature,
+          'kore.electricalContractor.signature',
+          'Electrical Contractor Signature',
+          false
+        )
+      : '';
+
+    return {
+      submissionData: {
+        project: ensureRequiredText(payload.project, 'Project'),
+        dateOfReport: ensureOptionalDateOnly(payload.dateOfReport, 'Date of Report'),
+        koreRepresentative: trimString(payload.koreRepresentative),
+        dateOnsite: ensureOptionalDateOnly(payload.dateOnsite, 'Date Onsite'),
+        onsiteTime: trimString(payload.onsiteTime),
+        departedTime: trimString(payload.departedTime),
+        onsiteContact: trimString(payload.onsiteContact),
+        whatWasDone: ensureRequiredText(payload.whatWasDone, 'What Was Done'),
+        issues: trimString(payload.issues),
+        nextSteps: trimString(payload.nextSteps),
+        submittedBy: trimString(payload.submittedBy),
+        systemStatus,
+        electricalContractor: {
+          name: electricalName,
+          signature: electricalSignature,
+        },
+        ownerRepresentative: {
+          name: ensureRequiredText(payload.ownerRepresentative?.name, "Owner's Representative Name"),
+          signature: resolveSubmittedOrDraftSignature(
+            fsrDoc,
+            payload.ownerRepresentative?.signature,
+            'kore.ownerRepresentative.signature',
+            "Owner's Representative Signature",
+            true
+          ),
+        },
+        notes: trimString(payload.notes),
+      },
+      assets: [],
+    };
+  }
+
   throwBadRequest('Unsupported FSR template');
+}
+
+function isManagerRole(role) {
+  return role === ROLES.ADMIN || role === ROLES.OFFICE_MANAGER;
+}
+
+/** Records that a manager has opened a SUBMITTED FSR (idempotent). */
+async function markFsrSeenForManager(fsrDoc, user) {
+  if (!fsrDoc || !user || !isManagerRole(user.role)) return;
+  if (fsrDoc.status !== FSR_STATUS.SUBMITTED) return;
+  const uid = String(user._id);
+  const alreadySeen = (fsrDoc.seenBy || []).some((id) => String(id) === uid);
+  if (alreadySeen) return;
+  await FsrDocument.updateOne({ _id: fsrDoc._id }, { $addToSet: { seenBy: user._id } });
+  fsrDoc.seenBy = [...(fsrDoc.seenBy || []), user._id];
+}
+
+/** Sets a per-request `statusSeen` boolean on each job for the requesting manager. */
+function annotateJobsWithStatusSeen(jobs, user) {
+  const list = Array.isArray(jobs) ? jobs : [];
+  const manager = isManagerRole(user?.role);
+  const uid = String(user?._id || '');
+  list.forEach((job) => {
+    if (!job) return;
+    const seen = !manager || (job.statusSeenBy || []).some((id) => String(id) === uid);
+    if (typeof job.set === 'function') job.set('statusSeen', seen, { strict: false });
+    else job.statusSeen = seen;
+  });
 }
 
 async function attachAssetUrlsToFsrData(data) {
@@ -879,6 +959,7 @@ function cloneDocumentEntries(entries) {
       contentType: String(doc.contentType || 'application/octet-stream').trim(),
       size: Number(doc.size) || 0,
       note: normalizeDocNote(doc.note),
+      isSiteInfo: Boolean(doc.isSiteInfo),
       uploadedBy: doc.uploadedBy?._id || doc.uploadedBy,
       uploadedAt: doc.uploadedAt ? new Date(doc.uploadedAt) : new Date(),
     }));
@@ -1113,6 +1194,7 @@ router.get('/', async (req, res) => {
 
     await annotateJobsWithLinkedReturnFlag(jobs);
     await attachFsrSummariesToJobs(jobs);
+    annotateJobsWithStatusSeen(jobs, req.user);
 
     res.json({
       success: true,
@@ -1128,6 +1210,22 @@ router.get('/', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+// ── GET /api/jobs/unseen-count ──────────────────────────────────────
+// Number of jobs whose status changed (or were created by someone else) that
+// this manager hasn't opened yet. Managers only.
+router.get(
+  '/unseen-count',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  async (req, res) => {
+    try {
+      const count = await Job.countDocuments({ statusSeenBy: { $ne: req.user._id } });
+      return res.json({ success: true, data: { count } });
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
 
 // ── GET /api/jobs/job-types ─────────────────────────────────────────
 router.get('/job-types', async (req, res) => {
@@ -1357,6 +1455,16 @@ router.get('/:id', async (req, res) => {
     const fsrDoc = await getFsrDocumentByJobId(job._id);
     data.fsrSummary = fsrDoc ? formatFsrDocument(fsrDoc).summary : null;
 
+    // Opening the job marks it "seen" for managers (clears the unseen indicator).
+    if (isManagerRole(req.user.role)) {
+      const uid = String(req.user._id);
+      const alreadySeen = (job.statusSeenBy || []).some((id) => String(id) === uid);
+      if (!alreadySeen) {
+        await Job.updateOne({ _id: job._id }, { $addToSet: { statusSeenBy: req.user._id } });
+      }
+      data.statusSeen = true;
+    }
+
     res.json({ success: true, data });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -1376,6 +1484,8 @@ router.post(
     body('estimatedCost').optional().isFloat({ min: 0 }).withMessage('Must be a positive number'),
     body('companyName').optional().trim(),
     body('levitonExternalFsrLink').optional().isString().withMessage('External FSR link must be a string'),
+    body('siteInfoMode').optional().isIn(['TEXT', 'PDF']).withMessage('Invalid site info mode'),
+    body('siteInfoText').optional().isString().withMessage('Site info must be a string'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -1463,6 +1573,8 @@ router.get('/:id/fsr', async (req, res) => {
         error: 'This FSR will become available after you start the completion flow from Mark Completed.',
       });
     }
+
+    await markFsrSeenForManager(fsrDoc, req.user);
 
     return res.json({ success: true, data: await buildFsrResponseData(job, fsrDoc) });
   } catch (error) {
@@ -2040,6 +2152,7 @@ router.post(
       fsrDoc.assets = assets;
       fsrDoc.submittedBy = req.user._id;
       fsrDoc.submittedAt = new Date();
+      fsrDoc.seenBy = [];
       await fsrDoc.save();
       await cancelPendingSignatureRequestsForFsr(
         fsrDoc._id,
@@ -2073,6 +2186,7 @@ router.post(
     body('files.*.contentType').optional().isString(),
     body('files.*.size').optional().isInt({ min: 0 }).withMessage('file size must be >= 0'),
     body('files.*.note').optional().isString().withMessage('file note must be a string'),
+    body('files.*.isSiteInfo').optional().isBoolean().withMessage('isSiteInfo must be a boolean'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -2114,6 +2228,7 @@ router.post(
             contentType,
             size: Number(file.size) || 0,
             note: normalizeDocNote(file.note),
+            isSiteInfo: Boolean(file.isSiteInfo),
             presignedUrl,
             expiresIn: 300,
           };
@@ -2136,6 +2251,7 @@ router.post(
     body('documents.*.key').notEmpty().withMessage('document key is required'),
     body('documents.*.fileName').notEmpty().withMessage('document fileName is required'),
     body('documents.*.note').optional().isString().withMessage('document note must be a string'),
+    body('documents.*.isSiteInfo').optional().isBoolean().withMessage('isSiteInfo must be a boolean'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -2170,6 +2286,7 @@ router.post(
           contentType: meta.ContentType || 'application/octet-stream',
           size: Number(meta.ContentLength) || 0,
           note: normalizeDocNote(item.note),
+          isSiteInfo: Boolean(item.isSiteInfo),
           uploadedBy: req.user._id,
           uploadedAt: new Date(),
         });
@@ -2237,6 +2354,7 @@ router.get('/:id/documents/:docId/url', async (req, res) => {
     const url = await getDownloadUrl({
       key: doc.key,
       fileName: doc.fileName,
+      contentType: doc.contentType,
       expiresIn: 900,
     });
 
@@ -2320,6 +2438,57 @@ router.delete('/:id/documents/:docId', async (req, res) => {
     res.status(status).json({ success: false, error: error.message });
   }
 });
+
+// ── PATCH /api/jobs/:id/documents/:docId (ADMIN, OFFICE_MANAGER) ─────
+// Toggle whether a document is the job-site info document shown to techs.
+router.patch(
+  '/:id/documents/:docId',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  [body('isSiteInfo').isBoolean().withMessage('isSiteInfo must be a boolean')],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const job = await Job.findById(req.params.id)
+        .select('_id status documents parentJob jobVisitKind')
+        .populate('parentJob', '_id');
+      if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+      if (!canAccessJob(req.user, job)) {
+        return res.status(403).json({ success: false, error: 'Not authorized' });
+      }
+
+      const familyJobs = await loadDocumentFamilyJobs(job);
+      const match = findDocumentInFamilyJobs(familyJobs, req.params.docId);
+      const doc = match?.doc;
+      if (!doc) return res.status(404).json({ success: false, error: 'Document not found' });
+
+      const nextValue = Boolean(req.body.isSiteInfo);
+      // Mirror the flag onto the same document across all linked family jobs.
+      for (const familyJob of familyJobs) {
+        let changed = false;
+        for (const item of familyJob.documents || []) {
+          if (
+            String(item._id) === String(req.params.docId) ||
+            String(item.key || '') === String(doc.key || '')
+          ) {
+            item.isSiteInfo = nextValue;
+            changed = true;
+          }
+        }
+        if (changed) await familyJob.save();
+      }
+
+      broadcastJobUpdate();
+      res.json({ success: true });
+    } catch (error) {
+      const status = error.status || 500;
+      res.status(status).json({ success: false, error: error.message });
+    }
+  }
+);
 
 // ── POST /api/jobs/:id/incomplete-return-request (TECHNICIAN or ADMIN / OFFICE_MANAGER) ──
 router.post(
@@ -3819,6 +3988,8 @@ router.put(
     body('scheduledDate').optional().custom(validateScheduledDate),
     body('estimatedCost').optional().isFloat({ min: 0 }).withMessage('Must be positive'),
     body('actualCost').optional().isFloat({ min: 0 }).withMessage('Must be positive'),
+    body('siteInfoMode').optional().isIn(['TEXT', 'PDF']).withMessage('Invalid site info mode'),
+    body('siteInfoText').optional().isString().withMessage('Site info must be a string'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -3880,7 +4051,7 @@ router.put(
         return res.status(result.status).json({ success: false, error: result.error });
       }
       await syncUnsubmittedFsrDocumentForJob(result.data, {
-        levitonExternalLink,
+        levitonExternalLink: levitonExternalFsrLink,
       });
       await attachFsrSummariesToJobs([result.data]);
 

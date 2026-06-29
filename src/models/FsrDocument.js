@@ -1,6 +1,6 @@
 const mongoose = require('mongoose');
 
-const FSR_TEMPLATE_KEYS = ['STANDARD', 'WATTSTOPPER', 'LEVITON_EXTERNAL'];
+const FSR_TEMPLATE_KEYS = ['STANDARD', 'WATTSTOPPER', 'LEVITON_EXTERNAL', 'KORE'];
 const FSR_STATUSES = ['NOT_STARTED', 'IN_PROGRESS', 'SUBMITTED'];
 const FSR_TEMPLATE_SOURCES = ['AUTO', 'MANUAL_OVERRIDE'];
 
@@ -119,6 +119,10 @@ const fsrDocumentSchema = new mongoose.Schema(
     submittedAt: {
       type: Date,
       default: null,
+    },
+    seenBy: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+      default: [],
     },
   },
   { timestamps: true }
