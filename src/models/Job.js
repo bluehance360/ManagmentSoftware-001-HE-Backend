@@ -303,11 +303,37 @@ const jobSchema = new mongoose.Schema(
       type: incompleteReturnRequestSchema,
       default: undefined,
     },
+    statusSeenBy: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+      default: [],
+    },
   },
   {
     timestamps: true,
   }
 );
+
+/**
+ * Centralized "unseen on status change" logic: any update that sets `status`
+ * (status transitions, assignment, reassignment, revert, etc. all use
+ * findOneAndUpdate with $set.status) also resets statusSeenBy so the job becomes
+ * unseen again for admins/managers. Marking a job seen uses updateOne/$addToSet,
+ * which does not trigger this hook.
+ */
+jobSchema.pre('findOneAndUpdate', function clearStatusSeenOnStatusChange() {
+  const update = this.getUpdate();
+  if (!update) return;
+  const set = update.$set || update;
+  const statusChanging = set && Object.prototype.hasOwnProperty.call(set, 'status');
+  if (!statusChanging) return;
+  if (update.$set) {
+    update.$set.statusSeenBy = [];
+    delete update.$addToSet?.statusSeenBy;
+  } else {
+    update.statusSeenBy = [];
+  }
+  this.setUpdate(update);
+});
 
 // Index for common queries
 jobSchema.index({ status: 1, assignedTechnician: 1 });

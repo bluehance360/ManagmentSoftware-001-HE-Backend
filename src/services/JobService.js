@@ -160,6 +160,7 @@ async function createJob(data, userId) {
     notes: data.notes,
     createdBy: userId,
     status: JOB_STATUS.TENTATIVE,
+    statusSeenBy: [userId],
     statusHistory: [
       {
         fromStatus: null,

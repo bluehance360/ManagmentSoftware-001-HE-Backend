@@ -504,6 +504,34 @@ async function buildSubmissionPayloadForFsr({ fsrDoc, submissionData, job, userI
   throwBadRequest('Unsupported FSR template');
 }
 
+function isManagerRole(role) {
+  return role === ROLES.ADMIN || role === ROLES.OFFICE_MANAGER;
+}
+
+/** Records that a manager has opened a SUBMITTED FSR (idempotent). */
+async function markFsrSeenForManager(fsrDoc, user) {
+  if (!fsrDoc || !user || !isManagerRole(user.role)) return;
+  if (fsrDoc.status !== FSR_STATUS.SUBMITTED) return;
+  const uid = String(user._id);
+  const alreadySeen = (fsrDoc.seenBy || []).some((id) => String(id) === uid);
+  if (alreadySeen) return;
+  await FsrDocument.updateOne({ _id: fsrDoc._id }, { $addToSet: { seenBy: user._id } });
+  fsrDoc.seenBy = [...(fsrDoc.seenBy || []), user._id];
+}
+
+/** Sets a per-request `statusSeen` boolean on each job for the requesting manager. */
+function annotateJobsWithStatusSeen(jobs, user) {
+  const list = Array.isArray(jobs) ? jobs : [];
+  const manager = isManagerRole(user?.role);
+  const uid = String(user?._id || '');
+  list.forEach((job) => {
+    if (!job) return;
+    const seen = !manager || (job.statusSeenBy || []).some((id) => String(id) === uid);
+    if (typeof job.set === 'function') job.set('statusSeen', seen, { strict: false });
+    else job.statusSeen = seen;
+  });
+}
+
 async function attachAssetUrlsToFsrData(data) {
   if (!data || !Array.isArray(data.assets) || data.assets.length === 0) return data;
 
@@ -1166,6 +1194,7 @@ router.get('/', async (req, res) => {
 
     await annotateJobsWithLinkedReturnFlag(jobs);
     await attachFsrSummariesToJobs(jobs);
+    annotateJobsWithStatusSeen(jobs, req.user);
 
     res.json({
       success: true,
@@ -1181,6 +1210,22 @@ router.get('/', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+// ── GET /api/jobs/unseen-count ──────────────────────────────────────
+// Number of jobs whose status changed (or were created by someone else) that
+// this manager hasn't opened yet. Managers only.
+router.get(
+  '/unseen-count',
+  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
+  async (req, res) => {
+    try {
+      const count = await Job.countDocuments({ statusSeenBy: { $ne: req.user._id } });
+      return res.json({ success: true, data: { count } });
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
 
 // ── GET /api/jobs/job-types ─────────────────────────────────────────
 router.get('/job-types', async (req, res) => {
@@ -1410,6 +1455,16 @@ router.get('/:id', async (req, res) => {
     const fsrDoc = await getFsrDocumentByJobId(job._id);
     data.fsrSummary = fsrDoc ? formatFsrDocument(fsrDoc).summary : null;
 
+    // Opening the job marks it "seen" for managers (clears the unseen indicator).
+    if (isManagerRole(req.user.role)) {
+      const uid = String(req.user._id);
+      const alreadySeen = (job.statusSeenBy || []).some((id) => String(id) === uid);
+      if (!alreadySeen) {
+        await Job.updateOne({ _id: job._id }, { $addToSet: { statusSeenBy: req.user._id } });
+      }
+      data.statusSeen = true;
+    }
+
     res.json({ success: true, data });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -1518,6 +1573,8 @@ router.get('/:id/fsr', async (req, res) => {
         error: 'This FSR will become available after you start the completion flow from Mark Completed.',
       });
     }
+
+    await markFsrSeenForManager(fsrDoc, req.user);
 
     return res.json({ success: true, data: await buildFsrResponseData(job, fsrDoc) });
   } catch (error) {
@@ -2095,6 +2152,7 @@ router.post(
       fsrDoc.assets = assets;
       fsrDoc.submittedBy = req.user._id;
       fsrDoc.submittedAt = new Date();
+      fsrDoc.seenBy = [];
       await fsrDoc.save();
       await cancelPendingSignatureRequestsForFsr(
         fsrDoc._id,

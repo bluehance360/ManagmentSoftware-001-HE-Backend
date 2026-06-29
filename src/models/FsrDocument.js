@@ -120,6 +120,10 @@ const fsrDocumentSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    seenBy: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+      default: [],
+    },
   },
   { timestamps: true }
 );
