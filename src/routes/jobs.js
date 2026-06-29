@@ -74,6 +74,7 @@ const EMPTY_PROGRAMMING_REQUIREMENT_DEFAULTS = {
 };
 const FSR_IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'heic', 'heif']);
 const FSR_MAX_ASSETS = 10;
+const KORE_SYSTEM_STATUSES = ['VERIFIED_ACCEPTED', 'CONFIRMATION', 'CONDITIONAL'];
 
 function normalizeJobType(value) {
   return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
@@ -446,6 +447,57 @@ async function buildSubmissionPayloadForFsr({ fsrDoc, submissionData, job, userI
         screenshot: screenshotAssets[0] || null,
       },
       assets: screenshotAssets,
+    };
+  }
+
+  if (fsrDoc.templateKey === FSR_TEMPLATE.KORE) {
+    const systemStatus = trimString(payload.systemStatus);
+    if (!KORE_SYSTEM_STATUSES.includes(systemStatus)) {
+      throwBadRequest('A system status selection is required');
+    }
+
+    const electricalName = trimString(payload.electricalContractor?.name);
+    const electricalSignature = electricalName
+      ? resolveSubmittedOrDraftSignature(
+          fsrDoc,
+          payload.electricalContractor?.signature,
+          'kore.electricalContractor.signature',
+          'Electrical Contractor Signature',
+          false
+        )
+      : '';
+
+    return {
+      submissionData: {
+        project: ensureRequiredText(payload.project, 'Project'),
+        dateOfReport: ensureOptionalDateOnly(payload.dateOfReport, 'Date of Report'),
+        koreRepresentative: trimString(payload.koreRepresentative),
+        dateOnsite: ensureOptionalDateOnly(payload.dateOnsite, 'Date Onsite'),
+        onsiteTime: trimString(payload.onsiteTime),
+        departedTime: trimString(payload.departedTime),
+        onsiteContact: trimString(payload.onsiteContact),
+        whatWasDone: ensureRequiredText(payload.whatWasDone, 'What Was Done'),
+        issues: trimString(payload.issues),
+        nextSteps: trimString(payload.nextSteps),
+        submittedBy: trimString(payload.submittedBy),
+        systemStatus,
+        electricalContractor: {
+          name: electricalName,
+          signature: electricalSignature,
+        },
+        ownerRepresentative: {
+          name: ensureRequiredText(payload.ownerRepresentative?.name, "Owner's Representative Name"),
+          signature: resolveSubmittedOrDraftSignature(
+            fsrDoc,
+            payload.ownerRepresentative?.signature,
+            'kore.ownerRepresentative.signature',
+            "Owner's Representative Signature",
+            true
+          ),
+        },
+        notes: trimString(payload.notes),
+      },
+      assets: [],
     };
   }
 

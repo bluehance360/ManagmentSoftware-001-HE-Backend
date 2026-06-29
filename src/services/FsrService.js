@@ -6,6 +6,7 @@ const FSR_TEMPLATE = {
   STANDARD: 'STANDARD',
   WATTSTOPPER: 'WATTSTOPPER',
   LEVITON_EXTERNAL: 'LEVITON_EXTERNAL',
+  KORE: 'KORE',
 };
 
 const FSR_STATUS = {
@@ -23,6 +24,7 @@ const FSR_TEMPLATE_LABELS = {
   [FSR_TEMPLATE.STANDARD]: 'Standard FSR',
   [FSR_TEMPLATE.WATTSTOPPER]: 'Wattstopper FSR',
   [FSR_TEMPLATE.LEVITON_EXTERNAL]: 'Leviton External FSR',
+  [FSR_TEMPLATE.KORE]: 'Kore FSR',
 };
 
 function normalizeJobType(value) {
@@ -37,6 +39,7 @@ function resolveFsrTemplateForJobType(jobType, opts = {}) {
   const normalized = normalizeJobType(jobType);
   if (normalized === 'wattstopper') return FSR_TEMPLATE.WATTSTOPPER;
   if (normalized === 'leviton') return FSR_TEMPLATE.LEVITON_EXTERNAL;
+  if (normalized === 'kore') return FSR_TEMPLATE.KORE;
   return opts.isProgramming || hasProgrammingSubtype(opts.programmingSubtype)
     ? FSR_TEMPLATE.STANDARD
     : null;
