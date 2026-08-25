@@ -5,7 +5,7 @@
  * Run: npm run seed
  */
 
-require('dotenv').config();
+require('../config/env');
 const mongoose = require('mongoose');
 const User = require('../models/User');
 const { ROLES } = require('../config/constants');

@@ -3,6 +3,7 @@ const User = require('../models/User');
 const { ROLES } = require('../config/constants');
 const { emitToUsers } = require('../socket');
 const { sendPushToUsers } = require('./PushService');
+const { sendJobEventEmails, TECH_TARGETED_EMAIL_TYPES } = require('./EmailNotificationService');
 
 /**
  * Create notification(s) for relevant users.
@@ -32,6 +33,9 @@ async function createNotification({
     if (recipientIds && recipientIds.length > 0) {
       recipients = recipientIds.map((id) => id.toString());
     }
+
+    // Explicitly targeted users (used to scope assignment emails to techs only)
+    const idTargeted = new Set(recipients);
 
     if (recipientRoles && recipientRoles.length > 0) {
       const users = await User.find({
@@ -124,6 +128,14 @@ async function createNotification({
         meta,
       },
     }).catch(() => {}); // non-blocking
+
+    // Send email for allowlisted job events (fire-and-forget).
+    // JOB_ASSIGNED / JOB_REASSIGNED email only the targeted technicians —
+    // the Admin/Office Manager broadcast copy stays in-app/push only.
+    const emailRecipients = TECH_TARGETED_EMAIL_TYPES.has(type)
+      ? notifiedRecipients.filter((id) => idTargeted.has(id))
+      : notifiedRecipients;
+    sendJobEventEmails(emailRecipients, { type, message, jobId, meta }).catch(() => {});
   } catch (error) {
     console.error('Failed to create notifications:', error.message);
     // Non-blocking — don't throw

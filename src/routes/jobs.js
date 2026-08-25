@@ -3961,6 +3961,7 @@ router.delete(
           type: 'JOB_DELETED',
           message: `Job "${jobTitle}" has been deleted by ${actorWithRole(req.user)}`,
           jobId: null,
+          meta: { jobTitle },
           recipientIds: notifRecipientIds,
           recipientRoles: notifRoles,
           excludeUserId: req.user._id,

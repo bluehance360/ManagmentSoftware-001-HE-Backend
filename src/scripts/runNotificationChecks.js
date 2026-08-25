@@ -11,7 +11,7 @@
  * given notification is never sent twice.
  */
 
-require('dotenv').config();
+require('../config/env');
 const mongoose = require('mongoose');
 const connectDB = require('../config/db');
 const scheduler = require('../services/SchedulerService');
@@ -37,6 +37,9 @@ const scheduler = require('../services/SchedulerService');
     console.log(`  Rule 3  started w/ pending documents: ${result.startedPendingDocs}`);
     console.log(`  Rule 4  FSR unsubmitted — tech:       ${result.fsrTechReminders}`);
     console.log(`  Rule 5  FSR unsubmitted — admin/mgr:  ${result.fsrAdminReminders}`);
+
+    // Drain fire-and-forget notification emails before the process exits
+    await require('../services/EmailNotificationService').waitForEmailQueue();
 
     await mongoose.disconnect();
     process.exit(0);
