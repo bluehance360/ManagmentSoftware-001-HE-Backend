@@ -1,5 +1,5 @@
 /**
- * JobService — hardened job lifecycle operations.
+ * JobService - hardened job lifecycle operations.
  *
  * Every status transition uses findOneAndUpdate with the current status
  * in the filter. If the document's status changed between the time the
@@ -120,7 +120,7 @@ const POPULATE_FIELDS = [
 
 /**
  * Validate whether role + currentStatus → newStatus is legal.
- * Pure function — no DB calls.
+ * Pure function - no DB calls.
  */
 function validateTransition(currentStatus, newStatus, role) {
   if (currentStatus === newStatus) {
@@ -277,7 +277,7 @@ async function transitionStatus(jobId, newStatus, user, notes) {
     notes: notes || `Status changed from ${currentStatus} to ${newStatus}`,
   };
 
-  // 5) Atomic update — status in filter prevents race condition
+  // 5) Atomic update - status in filter prevents race condition
   const updated = await Job.findOneAndUpdate(
     { _id: jobId, status: currentStatus },
     {
@@ -373,7 +373,7 @@ async function assignTechnician(
     if (cust?.firstPageRequired && !Boolean(assignmentChecklist?.firstPageReceived)) {
       return {
         error:
-          'This customer requires first page on file — check "First page received" on the assignment checklist before assigning.',
+          'This customer requires first page on file - check "First page received" on the assignment checklist before assigning.',
         status: 400,
       };
     }
@@ -457,7 +457,7 @@ async function assignTechnician(
  * Update non-status fields on a job.
  */
 async function updateJobDetails(jobId, data) {
-  // Strip status-related fields — never allow status changes through this path
+  // Strip status-related fields - never allow status changes through this path
   const { status, statusHistory, assignedTechnician, createdBy, ...safeData } = data;
   if (safeData.scheduledDate !== undefined) {
     safeData.scheduledDate = normalizeDateOnly(safeData.scheduledDate);
@@ -497,7 +497,7 @@ async function revertStatus(jobId, user) {
 
   const currentIdx = STATUS_ORDER.indexOf(job.status);
   if (currentIdx <= 0) {
-    return { error: 'Cannot revert — job is already at the initial status', status: 400 };
+    return { error: 'Cannot revert - job is already at the initial status', status: 400 };
   }
 
   const previousStatus = STATUS_ORDER[currentIdx - 1];

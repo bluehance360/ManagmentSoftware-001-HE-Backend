@@ -863,7 +863,7 @@ function notifyAssignmentRequirementNoteChanges({ job, entries, actorUser }) {
   const recipientIds = [];
   if (job.assignedTechnician) recipientIds.push(job.assignedTechnician);
   if (job.secondaryAssignedTechnician) recipientIds.push(job.secondaryAssignedTechnician);
-  const detail = entries.map((e) => `"${e.label}" — ${e.summary}`).join('; ');
+  const detail = entries.map((e) => `"${e.label}" - ${e.summary}`).join('; ');
   createNotification({
     type: 'JOB_DOCUMENTS_UPDATED',
     message: `Job "${job.title || 'Untitled'}": ${detail} by ${actorWithRole(actorUser)}.`,
@@ -2420,7 +2420,7 @@ router.delete('/:id/documents/:docId', async (req, res) => {
     if (job.secondaryAssignedTechnician) recipientIds.push(job.secondaryAssignedTechnician);
 
     let message = `${actorWithRole(req.user)} deleted "${fileName}" from job "${job.title}"`;
-    if (reason) message += ` — Reason: ${reason}`;
+    if (reason) message += ` - Reason: ${reason}`;
 
     createNotification({
       type: 'JOB_DOCUMENT_DELETED',
@@ -2586,7 +2586,7 @@ router.post(
       pushStatusHistoryNote(
         parent,
         req.user._id,
-        `Incomplete / Return request submitted (${reasonType}) — pending Admin / Office Manager approval.`
+        `Incomplete / Return request submitted (${reasonType}) - pending Admin / Office Manager approval.`
       );
       await parent.save();
 
@@ -2940,7 +2940,7 @@ router.patch(
       if (!prevOur && nextOur) {
         createNotification({
           type: 'JOB_RETURN_REVIEW_REQUESTED',
-          message: `${actorWithRole(req.user)} flagged "${workflowJob.title}" for an internal (our) issue — review required before the job can be completed.`,
+          message: `${actorWithRole(req.user)} flagged "${workflowJob.title}" for an internal (our) issue - review required before the job can be completed.`,
           jobId: workflowJob._id,
           recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
           excludeUserId: req.user._id,
@@ -3082,7 +3082,7 @@ router.patch(
       }
       if ([JOB_STATUS.BILLED, JOB_STATUS.PAID, JOB_STATUS.CLOSED].includes(req.body.status)) {
         notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
-        // Technicians are NOT notified for PAID / CLOSED — those statuses are hidden from them
+        // Technicians are NOT notified for PAID / CLOSED - those statuses are hidden from them
       }
       if (req.body.status === JOB_STATUS.CONFIRMED) {
         notifRoles.push(ROLES.ADMIN, ROLES.OFFICE_MANAGER);
@@ -3834,7 +3834,7 @@ router.patch(
       const job = result.data;
 
       // Reverting from IN_PROGRESS hides the FSR from the technician again
-      // (unless already submitted — a submitted FSR should remain visible)
+      // (unless already submitted - a submitted FSR should remain visible)
       if (result.revertedFrom === JOB_STATUS.IN_PROGRESS) {
         await FsrDocument.updateOne(
           { job: job._id, status: { $ne: FSR_STATUS.SUBMITTED } },

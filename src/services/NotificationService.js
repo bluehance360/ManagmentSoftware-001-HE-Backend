@@ -130,7 +130,7 @@ async function createNotification({
     }).catch(() => {}); // non-blocking
 
     // Send email for allowlisted job events (fire-and-forget).
-    // JOB_ASSIGNED / JOB_REASSIGNED email only the targeted technicians —
+    // JOB_ASSIGNED / JOB_REASSIGNED email only the targeted technicians -
     // the Admin/Office Manager broadcast copy stays in-app/push only.
     const emailRecipients = TECH_TARGETED_EMAIL_TYPES.has(type)
       ? notifiedRecipients.filter((id) => idTargeted.has(id))
@@ -138,7 +138,7 @@ async function createNotification({
     sendJobEventEmails(emailRecipients, { type, message, jobId, meta }).catch(() => {});
   } catch (error) {
     console.error('Failed to create notifications:', error.message);
-    // Non-blocking — don't throw
+    // Non-blocking - don't throw
   }
 }
 

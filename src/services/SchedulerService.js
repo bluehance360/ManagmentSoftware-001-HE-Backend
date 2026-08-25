@@ -1,5 +1,5 @@
 /**
- * SchedulerService — automated, time-based job notifications.
+ * SchedulerService - automated, time-based job notifications.
  *
  * A single node-cron task runs every 30 minutes and evaluates three rules:
  *
@@ -34,7 +34,7 @@ const SCHEDULED_HOUR_LOCAL = 8; // jobs are treated as starting at 08:00 LA time
 const CRON_EXPRESSION = '*/30 * * * *'; // every 30 minutes
 const OVERDUE_HOURS = 24;
 const DOC_REMINDER_THRESHOLDS = [24, 12, 6, 3, 1]; // hours before scheduled time
-// A reminder is eligible for one 35-min window — slightly wider than the cron
+// A reminder is eligible for one 35-min window - slightly wider than the cron
 // interval so a tick is never missed; the NotificationLog still guarantees
 // it is only sent once.
 const REMINDER_WINDOW_MS = 35 * 60 * 1000;
@@ -88,7 +88,7 @@ function scheduledStartUtc(dateOnly) {
   const y = Number(m[1]);
   const mo = Number(m[2]);
   const d = Number(m[3]);
-  // Use 20:00 UTC (~midday LA) as the reference — always safely past the 02:00
+  // Use 20:00 UTC (~midday LA) as the reference - always safely past the 02:00
   // DST switch, so the offset we read applies to our 08:00 target.
   const reference = new Date(Date.UTC(y, mo - 1, d, 20, 0, 0));
   const offsetMs = getTimezoneOffsetMs(TIMEZONE, reference);
@@ -137,7 +137,7 @@ async function claimNotification(jobId, type, ref = '') {
     await NotificationLog.create({ job: jobId, type, ref });
     return true;
   } catch (err) {
-    if (err && err.code === 11000) return false; // duplicate key — already sent
+    if (err && err.code === 11000) return false; // duplicate key - already sent
     throw err;
   }
 }
@@ -152,7 +152,7 @@ async function claimNotification(jobId, type, ref = '') {
 //   3. Call claimNotification() + createNotification(build…()) in the rule.
 
 /**
- * Core builder — every scheduler notification goes through this so the
+ * Core builder - every scheduler notification goes through this so the
  * structure (type, message, jobId, optional ids/roles, optional dedupeKey)
  * is always consistent.
  */
@@ -165,7 +165,7 @@ function buildScheduledPayload({ type, message, jobId, recipientIds = [], recipi
   return payload;
 }
 
-/** Rule 4 — FSR tech reminder: sent to the assigned technician(s). */
+/** Rule 4 - FSR tech reminder: sent to the assigned technician(s). */
 function buildFsrTechReminderPayload(job, hoursElapsed, dedupeKey) {
   return buildScheduledPayload({
     type: 'JOB_FSR_REMINDER_TECH',
@@ -176,7 +176,7 @@ function buildFsrTechReminderPayload(job, hoursElapsed, dedupeKey) {
   });
 }
 
-/** Rule 5 — FSR admin/manager reminder: broadcast to Admin + Office Manager roles. */
+/** Rule 5 - FSR admin/manager reminder: broadcast to Admin + Office Manager roles. */
 function buildFsrAdminReminderPayload(job, dedupeKey) {
   return buildScheduledPayload({
     type: 'JOB_FSR_REMINDER_ADMIN',
@@ -218,7 +218,7 @@ function nextDayAtAdminHourUtc(fromDate) {
  * Returns the due-time checkpoints (if any) that fall inside the current
  * 35-minute reminder window for the tech FSR reminder schedule:
  *   first at visibleAt + 12h, then every 24h.
- * Each entry is { dueMs, hoursElapsed } — at most one per tick.
+ * Each entry is { dueMs, hoursElapsed } - at most one per tick.
  */
 function getFsrTechCheckpoints(visibleAt, now) {
   const vMs = visibleAt.getTime();
@@ -247,7 +247,7 @@ function getFsrTechCheckpoints(visibleAt, now) {
  * Returns the due-time checkpoints (if any) that fall inside the current
  * 35-minute reminder window for the admin FSR reminder schedule:
  *   first at next-day 11:00 AM LA, then +12h, then every 24h.
- * Each entry is { dueMs } — at most one per tick.
+ * Each entry is { dueMs } - at most one per tick.
  */
 function getFsrAdminCheckpoints(visibleAt, now) {
   const firstDueMs = nextDayAtAdminHourUtc(visibleAt).getTime();
@@ -379,7 +379,7 @@ async function checkStartedJobsWithPendingDocuments() {
   return sent;
 }
 
-// ── Rule 4: FSR visible but not submitted — remind tech ────────────
+// ── Rule 4: FSR visible but not submitted - remind tech ────────────
 //
 // Fires for every IN_PROGRESS job whose FSR is visible to the technician
 // (technicianVisible: true) but has not been submitted yet.
@@ -418,7 +418,7 @@ async function checkFsrTechReminders() {
   return sent;
 }
 
-// ── Rule 5: FSR visible but not submitted — remind admin/manager ───
+// ── Rule 5: FSR visible but not submitted - remind admin/manager ───
 //
 // Fires for the same unsubmitted-FSR set as Rule 4, but targets Admins and
 // Office Managers instead of the technician.
@@ -502,7 +502,7 @@ async function runAllChecks() {
 
 let task = null;
 
-/** Register the cron task. Idempotent — safe to call once on server startup. */
+/** Register the cron task. Idempotent - safe to call once on server startup. */
 function start() {
   if (task) return task;
   task = cron.schedule(CRON_EXPRESSION, runAllChecks, {

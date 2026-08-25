@@ -7,7 +7,7 @@
  *
  *   Run: pnpm run notify:check       (from the backend/ directory)
  *
- * It is safe to run repeatedly — the NotificationLog dedup ledger ensures a
+ * It is safe to run repeatedly - the NotificationLog dedup ledger ensures a
  * given notification is never sent twice.
  */
 
@@ -35,8 +35,8 @@ const scheduler = require('../services/SchedulerService');
     console.log(`  Rule 1  overdue assigned jobs:        ${result.overdue}`);
     console.log(`  Rule 2  missing-document reminders:   ${result.docReminders}`);
     console.log(`  Rule 3  started w/ pending documents: ${result.startedPendingDocs}`);
-    console.log(`  Rule 4  FSR unsubmitted — tech:       ${result.fsrTechReminders}`);
-    console.log(`  Rule 5  FSR unsubmitted — admin/mgr:  ${result.fsrAdminReminders}`);
+    console.log(`  Rule 4  FSR unsubmitted - tech:       ${result.fsrTechReminders}`);
+    console.log(`  Rule 5  FSR unsubmitted - admin/mgr:  ${result.fsrAdminReminders}`);
 
     // Drain fire-and-forget notification emails before the process exits
     await require('../services/EmailNotificationService').waitForEmailQueue();

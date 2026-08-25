@@ -130,7 +130,7 @@ router.post(
 );
 
 // ── POST /api/auth/verify-otp ───────────────────────────────────────
-// Verify the OTP code — returns a one-time reset token
+// Verify the OTP code - returns a one-time reset token
 router.post(
   '/verify-otp',
   [

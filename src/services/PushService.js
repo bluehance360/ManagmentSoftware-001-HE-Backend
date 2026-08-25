@@ -48,7 +48,7 @@ async function sendPushToUser(userId, payload) {
 
 /**
  * Send a Web Push notification to multiple users.
- * Fire-and-forget — does not throw.
+ * Fire-and-forget - does not throw.
  */
 async function sendPushToUsers(userIds, payload) {
   if (!userIds || userIds.length === 0) return;

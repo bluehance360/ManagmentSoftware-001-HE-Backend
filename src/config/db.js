@@ -3,7 +3,7 @@ const dns = require('dns');
 
 // Use Google DNS directly for SRV lookups required by mongodb+srv://.
 // Some OS DNS resolvers (e.g. Windows stub resolver) silently drop SRV queries.
-// Google DNS (8.8.8.8) is public infrastructure — safe on all machines and in production.
+// Google DNS (8.8.8.8) is public infrastructure - safe on all machines and in production.
 dns.setServers(['8.8.8.8', '8.8.4.4']);
 
 const connectDB = async () => {

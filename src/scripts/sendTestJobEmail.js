@@ -14,7 +14,7 @@ const fs = require('fs');
 const path = require('path');
 
 if (process.env.DRY_RUN) {
-  // Patch the transport BEFORE EmailService builds it — renders to a file instead of sending.
+  // Patch the transport BEFORE EmailService builds it - renders to a file instead of sending.
   const nodemailer = require('nodemailer');
   nodemailer.createTransport = () => ({
     sendMail: async ({ to, subject, html }) => {
@@ -66,7 +66,7 @@ const { sendJobEventEmails, EMAIL_EVENT_LABELS } = require('../services/EmailNot
     jobId: job._id,
   });
 
-  console.log(process.env.DRY_RUN ? '\nDry run complete.' : '\nEmail sent — check the inbox.');
+  console.log(process.env.DRY_RUN ? '\nDry run complete.' : '\nEmail sent - check the inbox.');
   await mongoose.disconnect();
 })().catch((e) => {
   console.error('ERROR:', e.message);

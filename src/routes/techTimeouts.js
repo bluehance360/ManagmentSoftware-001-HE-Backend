@@ -297,7 +297,7 @@ router.get(
 );
 
 // ── POST /api/tech-timeouts  ────────────────────────────────────────
-// Create timeout — technician for themselves, admin/manager for any tech
+// Create timeout - technician for themselves, admin/manager for any tech
 router.post(
   '/',
   [

@@ -140,7 +140,7 @@ router.get('/verify/:token', async (req, res) => {
 });
 
 // ── POST /api/invitations/accept  (Public) ──────────────────────────
-// Accept an invitation — creates the user account
+// Accept an invitation - creates the user account
 router.post(
   '/accept',
   [
@@ -235,7 +235,7 @@ router.delete(
       const { email, role } = invitation;
       await Invitation.findByIdAndDelete(req.params.id);
 
-      // Notify the invitee — non-blocking
+      // Notify the invitee - non-blocking
       sendInviteRevokedEmail({ to: email, role }).catch((err) =>
         console.error('Failed to send revoke email:', err.message)
       );

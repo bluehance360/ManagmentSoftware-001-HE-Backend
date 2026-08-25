@@ -7,7 +7,7 @@
  * whether the event type warrants an email, resolves recipients to addresses,
  * enriches the email with job context, and fans out via the shared transporter.
  *
- * Only types listed in EMAIL_EVENT_LABELS produce emails — everything else
+ * Only types listed in EMAIL_EVENT_LABELS produce emails - everything else
  * (document churn, intermediate status steps, FSR editing activity) stays
  * in-app/push only so inboxes aren't flooded.
  */
@@ -33,19 +33,19 @@ const EMAIL_EVENT_LABELS = {
   JOB_RETURN_VISIT_CREATED: 'Return Visit Scheduled',
   JOB_RETURN_REVIEW_REQUESTED: 'Internal Issue Review Requested',
   JOB_RETURN_REVIEW_RESOLVED: 'Internal Issue Review Resolved',
-  JOB_OVERDUE_INCOMPLETE: 'Job Overdue — Not Completed',
+  JOB_OVERDUE_INCOMPLETE: 'Job Overdue - Not Completed',
   JOB_DOCS_MISSING_REMINDER: 'Missing Documents Reminder',
-  JOB_STARTED_DOCS_PENDING: 'Job Started — Documents Pending',
+  JOB_STARTED_DOCS_PENDING: 'Job Started - Documents Pending',
   JOB_FSR_REMINDER_TECH: 'FSR Pending Reminder',
   JOB_FSR_REMINDER_ADMIN: 'FSR Pending Reminder',
 };
 
 // For these types, only the explicitly targeted users (recipientIds) are
-// emailed — the Admin/Office Manager broadcast copy stays in-app/push only.
+// emailed - the Admin/Office Manager broadcast copy stays in-app/push only.
 const TECH_TARGETED_EMAIL_TYPES = new Set(['JOB_ASSIGNED', 'JOB_REASSIGNED']);
 
 // In-flight email sends. Long-lived processes never need this, but short-lived
-// scripts (the cron runner) must drain it before exiting, or fire-and-forget
+// scripts (the cron r-nner) must drain it before exiting, or fire-and-forget
 // emails are killed mid-send.
 const inFlight = new Set();
 
@@ -91,7 +91,7 @@ function buildJobDetails(job) {
  * @param {string|null} [opts.jobId] - related job id (null e.g. for JOB_DELETED)
  * @param {Object} [opts.meta] - notification meta (meta.jobTitle used when the job is gone)
  */
-function sendJobEventEmails(recipientIds, payload) {
+function sendJobEventEmails(recipi-ntIds, payload) {
   const promise = sendJobEventEmailsInner(recipientIds, payload).finally(() => {
     inFlight.delete(promise);
   });
@@ -123,7 +123,7 @@ async function sendJobEventEmailsInner(recipientIds, { type, message, jobId, met
     }
     const details = buildJobDetails(job);
     const subjectSuffix = job?.title || meta?.jobTitle || undefined;
-
+-
     const results = await Promise.allSettled(
       users.map((user) =>
         sendJobEventEmail({

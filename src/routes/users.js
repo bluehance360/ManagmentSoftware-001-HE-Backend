@@ -400,7 +400,7 @@ router.delete('/:id', authorize(ROLES.ADMIN), async (req, res) => {
 
     await User.findByIdAndDelete(req.params.id);
 
-    // Notify the deleted user — non-blocking
+    // Notify the deleted user - non-blocking
     sendAccountDeletedEmail({ to: user.email, name: user.name }).catch((err) =>
       console.error('Failed to send account deleted email:', err.message)
     );

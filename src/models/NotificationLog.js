@@ -6,7 +6,7 @@ const mongoose = require('mongoose');
  * The scheduler (SchedulerService) runs every 30 minutes and re-evaluates every
  * eligible job. Before sending an automated notification it "claims" a row here;
  * the unique { job, type, ref } index makes the claim atomic, so a given
- * notification can only ever be sent once — even across server restarts or if
+ * notification can only ever be sent once - even across server restarts or if
  * two cron ticks overlap.
  *
  * `ref` is a discriminator that lets the same notification type fire again when
