@@ -91,7 +91,7 @@ function buildJobDetails(job) {
  * @param {string|null} [opts.jobId] - related job id (null e.g. for JOB_DELETED)
  * @param {Object} [opts.meta] - notification meta (meta.jobTitle used when the job is gone)
  */
-function sendJobEventEmails(recipi-ntIds, payload) {
+function sendJobEventEmails(recipientIds, payload) {
   const promise = sendJobEventEmailsInner(recipientIds, payload).finally(() => {
     inFlight.delete(promise);
   });
@@ -123,7 +123,6 @@ async function sendJobEventEmailsInner(recipientIds, { type, message, jobId, met
     }
     const details = buildJobDetails(job);
     const subjectSuffix = job?.title || meta?.jobTitle || undefined;
--
     const results = await Promise.allSettled(
       users.map((user) =>
         sendJobEventEmail({
