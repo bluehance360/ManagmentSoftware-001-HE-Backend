@@ -60,13 +60,6 @@ function buildDocumentKey(jobId, originalName) {
   return `jobs/${jobId}/documents/${stamp}-${rand}-${safeName}`;
 }
 
-function buildCertificateKey(userId, jobTypeId, originalName) {
-  const safeName = sanitizeFileName(originalName);
-  const stamp = Date.now();
-  const rand = Math.random().toString(36).slice(2, 10);
-  return `users/${userId}/certificates/${jobTypeId}/${stamp}-${rand}-${safeName}`;
-}
-
 function buildFsrAssetKey(jobId, originalName) {
   const safeName = sanitizeFileName(originalName);
   const stamp = Date.now();
@@ -113,7 +106,6 @@ async function deleteObject(key) {
 module.exports = {
   sanitizeFileName,
   buildDocumentKey,
-  buildCertificateKey,
   buildFsrAssetKey,
   getUploadUrl,
   getDownloadUrl,

@@ -5,13 +5,7 @@ const JobType = require('../models/JobType');
 const { authenticate, authorize } = require('../middleware/auth');
 const { ROLES } = require('../config/constants');
 const { sendAccountDeletedEmail } = require('../services/EmailService');
-const {
-  buildCertificateKey,
-  getUploadUrl,
-  getDownloadUrl,
-  headObject,
-  deleteObject,
-} = require('../services/S3Service');
+const { getDownloadUrl, deleteObject } = require('../services/S3Service');
 
 const router = express.Router();
 
@@ -75,14 +69,9 @@ router.get(
   }
 );
 
-// ── Certificate management (ADMIN, OFFICE_MANAGER) ────────────────────
-// Allowed file extensions for certificate uploads
-const ALLOWED_CERT_EXT = new Set(['pdf', 'jpg', 'jpeg', 'png', 'doc', 'docx']);
-
-function isAllowedCertFile(name) {
-  const ext = (name || '').split('.').pop().toLowerCase();
-  return ALLOWED_CERT_EXT.has(ext);
-}
+// ── Certification management (ADMIN, OFFICE_MANAGER) ──────────────────
+// A technician is certified for a job type when they have a `certificates` entry for it.
+// Certifications are marked directly - no certificate document is required.
 
 async function loadCertifiableJobType(jobTypeId) {
   const type = await JobType.findById(jobTypeId).lean();
@@ -106,20 +95,17 @@ async function loadTechnicianForCerts(id) {
 }
 
 /**
- * @route   POST /api/users/:id/certificates/presign
- * @desc    Presign one or more certificate uploads to S3
+ * @route   POST /api/users/:id/certificates
+ * @desc    Mark a technician as certified for one or more job types (no document needed)
  * @access  Private (ADMIN, OFFICE_MANAGER)
  */
 router.post(
-  '/:id/certificates/presign',
+  '/:id/certificates',
   authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   [
     param('id').isMongoId().withMessage('Invalid technician ID'),
-    body('files').isArray({ min: 1 }).withMessage('files must be a non-empty array'),
-    body('files.*.jobTypeId').isMongoId().withMessage('jobTypeId is required'),
-    body('files.*.fileName').notEmpty().withMessage('fileName is required'),
-    body('files.*.contentType').optional().isString(),
-    body('files.*.size').optional().isInt({ min: 0 }),
+    body('jobTypeIds').isArray({ min: 1 }).withMessage('Select at least one job type'),
+    body('jobTypeIds.*').isMongoId().withMessage('Invalid job type ID'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -131,117 +117,26 @@ router.post(
       const { tech, error: techErr, status: techStatus } = await loadTechnicianForCerts(req.params.id);
       if (techErr) return res.status(techStatus).json({ success: false, error: techErr });
 
-      const files = req.body.files.slice(0, 10);
-      const invalid = files.find((f) => !isAllowedCertFile(f.fileName));
-      if (invalid) {
-        return res.status(400).json({
-          success: false,
-          error: `File type not allowed: "${invalid.fileName}". Accepted: PDF, JPG, JPEG, PNG, DOC, DOCX`,
-        });
-      }
-
-      const uploads = await Promise.all(
-        files.map(async (file) => {
-          const { type, error: typeErr, status: typeStatus } = await loadCertifiableJobType(file.jobTypeId);
-          if (typeErr) {
-            const err = new Error(typeErr);
-            err.status = typeStatus;
-            throw err;
-          }
-          const key = buildCertificateKey(tech._id.toString(), type._id.toString(), file.fileName);
-          const contentType = file.contentType || 'application/octet-stream';
-          const presignedUrl = await getUploadUrl({ key, contentType, expiresIn: 300 });
-          return {
-            jobTypeId: type._id,
-            jobTypeName: type.name,
-            key,
-            fileName: file.fileName,
-            contentType,
-            size: Number(file.size) || 0,
-            presignedUrl,
-            expiresIn: 300,
-          };
-        })
-      );
-
-      res.json({ success: true, data: { uploads } });
-    } catch (error) {
-      const status = error.status || 500;
-      res.status(status).json({ success: false, error: error.message });
-    }
-  }
-);
-
-/**
- * @route   POST /api/users/:id/certificates/complete
- * @desc    Confirm S3 uploads and persist cert entries on the technician
- * @access  Private (ADMIN, OFFICE_MANAGER)
- */
-router.post(
-  '/:id/certificates/complete',
-  authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
-  [
-    param('id').isMongoId().withMessage('Invalid technician ID'),
-    body('entries').isArray({ min: 1 }).withMessage('entries must be a non-empty array'),
-    body('entries.*.jobTypeId').isMongoId().withMessage('jobTypeId is required'),
-    body('entries.*.key').notEmpty().withMessage('key is required'),
-    body('entries.*.fileName').notEmpty().withMessage('fileName is required'),
-  ],
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ success: false, errors: errors.array() });
-    }
-
-    try {
-      const { tech, error: techErr, status: techStatus } = await loadTechnicianForCerts(req.params.id);
-      if (techErr) return res.status(techStatus).json({ success: false, error: techErr });
-
-      const incoming = req.body.entries.slice(0, 10);
-      const replacedKeys = [];
-
-      for (const item of incoming) {
-        const { type, error: typeErr, status: typeStatus } = await loadCertifiableJobType(item.jobTypeId);
+      const jobTypeIds = [...new Set(req.body.jobTypeIds.map(String))].slice(0, 50);
+      for (const jobTypeId of jobTypeIds) {
+        const { type, error: typeErr, status: typeStatus } = await loadCertifiableJobType(jobTypeId);
         if (typeErr) return res.status(typeStatus).json({ success: false, error: typeErr });
 
-        const expectedPrefix = `users/${tech._id}/certificates/${type._id}/`;
-        if (!item.key.startsWith(expectedPrefix)) {
-          return res.status(400).json({
-            success: false,
-            error: `Invalid certificate key for ${type.name}`,
-          });
-        }
-
-        const meta = await headObject(item.key);
-
-        const existingIdx = tech.certificates.findIndex(
+        // Already certified (with or without a document) - leave the existing entry as is.
+        const alreadyCertified = tech.certificates.some(
           (c) => c.jobTypeId.toString() === type._id.toString()
         );
-        if (existingIdx !== -1) {
-          replacedKeys.push(tech.certificates[existingIdx].document?.key);
-          tech.certificates.splice(existingIdx, 1);
-        }
+        if (alreadyCertified) continue;
+
         tech.certificates.push({
           jobTypeId: type._id,
           jobTypeName: type.name,
-          document: {
-            key: item.key,
-            fileName: item.fileName,
-            contentType: meta.ContentType || 'application/octet-stream',
-            size: Number(meta.ContentLength) || 0,
-          },
           uploadedAt: new Date(),
           uploadedBy: req.user._id,
         });
       }
 
       await tech.save();
-
-      // Best-effort cleanup of replaced S3 objects
-      await Promise.all(
-        replacedKeys.filter(Boolean).map((key) => deleteObject(key).catch(() => null))
-      );
-
       res.json({ success: true, data: { certificates: tech.certificates } });
     } catch (error) {
       const status = error.status || 500;
@@ -273,6 +168,12 @@ router.get(
       );
       if (!cert) {
         return res.status(404).json({ success: false, error: 'Certificate not found' });
+      }
+      if (!cert.document?.key) {
+        return res.status(404).json({
+          success: false,
+          error: 'No certificate document is attached to this certification',
+        });
       }
       const url = await getDownloadUrl({
         key: cert.document.key,

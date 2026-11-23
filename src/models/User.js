@@ -2,6 +2,20 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const { ROLES } = require('../config/constants');
 
+// Certificate file attached to an older certification. New certifications are marked
+// without a document, so this is optional.
+const certificateDocumentSchema = new mongoose.Schema(
+  {
+    key: { type: String, required: true },
+    fileName: { type: String, required: true },
+    contentType: { type: String, default: 'application/octet-stream' },
+    size: { type: Number, default: 0 },
+  },
+  { _id: false }
+);
+
+// One entry per job type the technician is certified for. The entry existing is what
+// makes the technician certified - a document is not required.
 const certificateSchema = new mongoose.Schema(
   {
     jobTypeId: {
@@ -15,11 +29,10 @@ const certificateSchema = new mongoose.Schema(
       trim: true,
     },
     document: {
-      key: { type: String, required: true },
-      fileName: { type: String, required: true },
-      contentType: { type: String, default: 'application/octet-stream' },
-      size: { type: Number, default: 0 },
+      type: certificateDocumentSchema,
+      default: undefined,
     },
+    // When/by whom the technician was marked certified (name kept for existing data).
     uploadedAt: { type: Date, default: Date.now },
     uploadedBy: {
       type: mongoose.Schema.Types.ObjectId,
