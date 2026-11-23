@@ -74,6 +74,13 @@ const EMPTY_PROGRAMMING_REQUIREMENT_DEFAULTS = {
 };
 const FSR_IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'heic', 'heif']);
 const FSR_MAX_ASSETS = 10;
+/** Presign purpose for the completed FSR uploaded as a single file of any type (Leviton only). */
+const FSR_ASSET_PURPOSE_DOCUMENT = 'FSR_DOCUMENT';
+/** How a Leviton External FSR is completed: external link + confirmation, or an uploaded FSR file. */
+const LEVITON_COMPLETION_METHOD = {
+  LINK: 'LINK',
+  DOCUMENT: 'DOCUMENT',
+};
 const KORE_SYSTEM_STATUSES = ['VERIFIED_ACCEPTED', 'CONFIRMATION', 'CONDITIONAL'];
 
 function normalizeJobType(value) {
@@ -260,7 +267,14 @@ function resolveSubmittedOrDraftSignature(fsrDoc, payloadValue, signatureFieldKe
   return '';
 }
 
-async function normalizeFsrAssets(rawAssets, jobId, userId, maxCount = FSR_MAX_ASSETS) {
+function getLevitonCompletionMethod(submissionPayload) {
+  return submissionPayload?.completionMethod === LEVITON_COMPLETION_METHOD.DOCUMENT
+    ? LEVITON_COMPLETION_METHOD.DOCUMENT
+    : LEVITON_COMPLETION_METHOD.LINK;
+}
+
+async function normalizeFsrAssets(rawAssets, jobId, userId, maxCount = FSR_MAX_ASSETS, options = {}) {
+  const allowAnyFileType = options.anyFileType === true;
   if (rawAssets === undefined) return [];
   if (!Array.isArray(rawAssets)) {
     throwBadRequest('FSR assets must be an array');
@@ -282,7 +296,7 @@ async function normalizeFsrAssets(rawAssets, jobId, userId, maxCount = FSR_MAX_A
 
     const meta = await headObject(key);
     const contentType = String(meta.ContentType || item?.contentType || 'application/octet-stream').trim();
-    if (!contentType.startsWith('image/')) {
+    if (!allowAnyFileType && !contentType.startsWith('image/')) {
       throwBadRequest(`FSR asset "${fileName}" must be an image`);
     }
 
@@ -430,6 +444,27 @@ async function buildSubmissionPayloadForFsr({ fsrDoc, submissionData, job, userI
   }
 
   if (fsrDoc.templateKey === FSR_TEMPLATE.LEVITON_EXTERNAL) {
+    // DOCUMENT: the completed FSR is uploaded as one file (any type) - nothing else is required.
+    // LINK (default, also for older clients that send no method): external link (checked by the
+    // submit route) + completion checkbox, optional reference number / notes / screenshot.
+    if (getLevitonCompletionMethod(payload) === LEVITON_COMPLETION_METHOD.DOCUMENT) {
+      const documentAssets = payload.fsrDocumentAsset
+        ? await normalizeFsrAssets([payload.fsrDocumentAsset], job._id, userId, 1, { anyFileType: true })
+        : [];
+      if (!documentAssets.length) {
+        throwBadRequest('Upload the FSR document before submitting');
+      }
+
+      return {
+        submissionData: {
+          completionMethod: LEVITON_COMPLETION_METHOD.DOCUMENT,
+          completionConfirmed: true,
+          fsrDocument: documentAssets[0],
+        },
+        assets: documentAssets,
+      };
+    }
+
     const completionConfirmed = ensureBoolean(payload.completionConfirmed, 'Completion');
     if (!completionConfirmed) {
       throwBadRequest('Completion must be checked before submitting the Leviton FSR');
@@ -441,6 +476,7 @@ async function buildSubmissionPayloadForFsr({ fsrDoc, submissionData, job, userI
 
     return {
       submissionData: {
+        completionMethod: LEVITON_COMPLETION_METHOD.LINK,
         completionConfirmed: true,
         externalFsrReferenceNumber: trimString(payload.externalFsrReferenceNumber),
         internalNotes: trimString(payload.internalNotes),
@@ -549,14 +585,15 @@ async function attachAssetUrlsToFsrData(data) {
   const urlByKey = new Map(assets.map((asset) => [asset.key, asset.url]));
   data.assets = assets;
 
-  if (data.templateKey === FSR_TEMPLATE.LEVITON_EXTERNAL && data.submissionData?.screenshot?.key) {
-    data.submissionData = {
-      ...data.submissionData,
-      screenshot: {
-        ...data.submissionData.screenshot,
-        url: urlByKey.get(data.submissionData.screenshot.key) || '',
-      },
-    };
+  if (data.templateKey === FSR_TEMPLATE.LEVITON_EXTERNAL && data.submissionData) {
+    const nextSubmission = { ...data.submissionData };
+    ['screenshot', 'fsrDocument'].forEach((field) => {
+      const asset = nextSubmission[field];
+      if (asset?.key) {
+        nextSubmission[field] = { ...asset, url: urlByKey.get(asset.key) || '' };
+      }
+    });
+    data.submissionData = nextSubmission;
   }
 
   if (
@@ -2024,6 +2061,10 @@ router.post(
     body('files.*.contentType').optional().isString(),
     body('files.*.size').optional().isInt({ min: 0 }).withMessage('file size must be >= 0'),
     body('files.*.caption').optional().isString().withMessage('file caption must be a string'),
+    body('purpose')
+      .optional()
+      .isIn([FSR_ASSET_PURPOSE_DOCUMENT])
+      .withMessage(`purpose must be ${FSR_ASSET_PURPOSE_DOCUMENT}`),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -2032,6 +2073,7 @@ router.post(
     }
 
     try {
+      const isDocumentUpload = req.body.purpose === FSR_ASSET_PURPOSE_DOCUMENT;
       const job = await Job.findById(req.params.id)
         .select('_id title status assignedTechnician secondaryAssignedTechnician parentJob jobVisitKind')
         .populate('parentJob', 'assignedTechnician secondaryAssignedTechnician');
@@ -2054,11 +2096,26 @@ router.post(
         return res.status(400).json({ success: false, error: 'Submitted FSRs are read-only' });
       }
 
-      const files = req.body.files.slice(0, FSR_MAX_ASSETS);
-      const invalid = files.find((file) => {
-        const ext = String(file.name || '').split('.').pop().toLowerCase();
-        return !FSR_IMAGE_EXTENSIONS.has(ext);
-      });
+      if (isDocumentUpload) {
+        if (fsrDoc.templateKey !== FSR_TEMPLATE.LEVITON_EXTERNAL) {
+          return res.status(400).json({
+            success: false,
+            error: 'FSR document upload is only available for Leviton FSRs',
+          });
+        }
+        if (req.body.files.length !== 1) {
+          return res.status(400).json({ success: false, error: 'Upload one FSR document at a time' });
+        }
+      }
+
+      const files = req.body.files.slice(0, isDocumentUpload ? 1 : FSR_MAX_ASSETS);
+      // The FSR document may be any file type (PDF, Word, image, CSV, ...); photos must be images.
+      const invalid = isDocumentUpload
+        ? null
+        : files.find((file) => {
+          const ext = String(file.name || '').split('.').pop().toLowerCase();
+          return !FSR_IMAGE_EXTENSIONS.has(ext);
+        });
       if (invalid) {
         return res.status(400).json({
           success: false,
@@ -2128,8 +2185,10 @@ router.post(
       if (fsrDoc.status === FSR_STATUS.SUBMITTED) {
         return res.status(400).json({ success: false, error: 'This FSR has already been submitted' });
       }
+      // The external link is only required when the Leviton FSR is completed via the link option.
       if (
         fsrDoc.templateKey === FSR_TEMPLATE.LEVITON_EXTERNAL &&
+        getLevitonCompletionMethod(req.body.submissionData) === LEVITON_COMPLETION_METHOD.LINK &&
         !trimString(fsrDoc.levitonExternalLink)
       ) {
         return res.status(400).json({

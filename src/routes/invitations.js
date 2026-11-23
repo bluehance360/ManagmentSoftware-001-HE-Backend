@@ -6,8 +6,22 @@ const { authenticate, authorize } = require('../middleware/auth');
 const { ROLES } = require('../config/constants');
 const { sendInvitationEmail, sendInviteRevokedEmail } = require('../services/EmailService');
 const { createNotification } = require('../services/NotificationService');
+const { emitToUsers } = require('../socket');
 
 const router = express.Router();
+
+/**
+ * Tell every open Team page (Admins / Office Managers) to reload its member + invitation list.
+ * `excludeUserId` skips the user who made the change - their page already refreshes itself.
+ */
+function broadcastTeamUpdate(excludeUserId) {
+  emitToUsers({
+    event: 'team:updated',
+    data: {},
+    recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
+    excludeUserId,
+  });
+}
 
 // ── GET /api/invitations  (ADMIN only) ──────────────────────────────
 // List all pending (not yet accepted, not expired) invitations
@@ -86,13 +100,27 @@ router.post(
         expiresAt,
       });
 
-      // Send email
-      await sendInvitationEmail({
-        to: email,
-        role,
-        token,
-        invitedByName: req.user.name,
-      });
+      // Send email. If it fails, roll back the invitation so it doesn't show up as
+      // "pending" in the team list or block a retry with "already sent".
+      try {
+        await sendInvitationEmail({
+          to: email,
+          role,
+          token,
+          invitedByName: req.user.name,
+        });
+      } catch (emailError) {
+        console.error('Invitation email failed, removing invitation:', emailError);
+        await Invitation.findByIdAndDelete(invitation._id).catch((cleanupError) =>
+          console.error('Failed to remove unsent invitation:', cleanupError.message)
+        );
+        return res.status(502).json({
+          success: false,
+          error: 'Failed to send the invitation email. Please try again.',
+        });
+      }
+
+      broadcastTeamUpdate(req.user._id);
 
       res.status(201).json({
         success: true,
@@ -206,6 +234,9 @@ router.post(
         recipientRoles: [ROLES.ADMIN],
       });
 
+      // The "Invite Pending" row becomes a real member - refresh open Team pages live.
+      broadcastTeamUpdate();
+
       res.json({
         success: true,
         message: 'Account created successfully. Please sign in.',
@@ -234,6 +265,7 @@ router.delete(
 
       const { email, role } = invitation;
       await Invitation.findByIdAndDelete(req.params.id);
+      broadcastTeamUpdate(req.user._id);
 
       // Notify the invitee - non-blocking
       sendInviteRevokedEmail({ to: email, role }).catch((err) =>
