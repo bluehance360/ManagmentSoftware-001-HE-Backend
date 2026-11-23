@@ -55,41 +55,16 @@ router.get(
   authorize(ROLES.ADMIN, ROLES.OFFICE_MANAGER),
   async (req, res) => {
     try {
-      const Job = require('../models/Job');
-      const { JOB_STATUS } = require('../config/constants');
-
+      // Techs can hold multiple jobs at once, so no "busy" flag here; availability
+      // for a date comes from approved time-off (GET /api/tech-timeouts/availability).
       const technicians = await User.find({
         role: ROLES.TECHNICIAN,
         isActive: true,
       }).select('name email certificates').lean();
 
-      // Attach active job info so the frontend can show a "Busy" indicator
-      const activeJobs = await Job.find({
-        $or: [
-          { assignedTechnician: { $in: technicians.map((t) => t._id) } },
-          { secondaryAssignedTechnician: { $in: technicians.map((t) => t._id) } },
-        ],
-        status: { $in: [JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS] },
-      }).select('assignedTechnician secondaryAssignedTechnician title status').lean();
-
-      const activeJobMap = {};
-      for (const j of activeJobs) {
-        if (j.assignedTechnician) {
-          activeJobMap[j.assignedTechnician.toString()] = { title: j.title, status: j.status };
-        }
-        if (j.secondaryAssignedTechnician) {
-          activeJobMap[j.secondaryAssignedTechnician.toString()] = { title: j.title, status: j.status };
-        }
-      }
-
-      const enriched = technicians.map((t) => ({
-        ...t,
-        activeJob: activeJobMap[t._id.toString()] || null,
-      }));
-
       res.json({
         success: true,
-        data: enriched,
+        data: technicians,
       });
     } catch (error) {
       res.status(500).json({

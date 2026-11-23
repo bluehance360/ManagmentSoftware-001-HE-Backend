@@ -15,7 +15,7 @@ const TechTimeout = require('../models/TechTimeout');
 const { createNotification } = require('../services/NotificationService');
 const { getIO } = require('../socket');
 const { sendFsrSignatureRequestEmail } = require('../services/EmailService');
-const { normalizeDateOnly, isDateOnly, toLocalDateOnly } = require('../utils/dateOnly');
+const { normalizeDateOnly, isDateOnly, toLocalDateOnly, formatDateOnly } = require('../utils/dateOnly');
 const {
   buildDocumentKey,
   buildFsrAssetKey,
@@ -74,8 +74,10 @@ const EMPTY_PROGRAMMING_REQUIREMENT_DEFAULTS = {
 };
 const FSR_IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'heic', 'heif']);
 const FSR_MAX_ASSETS = 10;
-/** Presign purpose for the completed FSR uploaded as a single file of any type (Leviton only). */
+/** Presign purpose for the completed FSR uploaded as a single file of any type (all templates). */
 const FSR_ASSET_PURPOSE_DOCUMENT = 'FSR_DOCUMENT';
+/** Any FSR template can be completed by uploading the finished FSR instead of filling the form. */
+const FSR_DOCUMENT_COMPLETION_METHOD = 'DOCUMENT';
 /** How a Leviton External FSR is completed: external link + confirmation, or an uploaded FSR file. */
 const LEVITON_COMPLETION_METHOD = {
   LINK: 'LINK',
@@ -317,6 +319,26 @@ async function normalizeFsrAssets(rawAssets, jobId, userId, maxCount = FSR_MAX_A
 async function buildSubmissionPayloadForFsr({ fsrDoc, submissionData, job, userId }) {
   const payload = submissionData && typeof submissionData === 'object' ? submissionData : {};
 
+  // Upload option (every template): the completed FSR is one file of any type - nothing else is required.
+  if (payload.completionMethod === FSR_DOCUMENT_COMPLETION_METHOD) {
+    const documentAssets = payload.fsrDocumentAsset
+      ? await normalizeFsrAssets([payload.fsrDocumentAsset], job._id, userId, 1, { anyFileType: true })
+      : [];
+    if (!documentAssets.length) {
+      throwBadRequest('Upload the FSR document before submitting');
+    }
+
+    return {
+      submissionData: {
+        completionMethod: FSR_DOCUMENT_COMPLETION_METHOD,
+        // Leviton submissions have always carried this flag; keep the shape the same.
+        ...(fsrDoc.templateKey === FSR_TEMPLATE.LEVITON_EXTERNAL ? { completionConfirmed: true } : {}),
+        fsrDocument: documentAssets[0],
+      },
+      assets: documentAssets,
+    };
+  }
+
   if (fsrDoc.templateKey === FSR_TEMPLATE.STANDARD) {
     const techSupportContacted = ensureBoolean(payload.techSupportContacted, 'Tech Support Contacted');
     const returnTripNeeded = ensureBoolean(payload.returnTripNeeded, 'Return Trip Needed');
@@ -444,27 +466,9 @@ async function buildSubmissionPayloadForFsr({ fsrDoc, submissionData, job, userI
   }
 
   if (fsrDoc.templateKey === FSR_TEMPLATE.LEVITON_EXTERNAL) {
-    // DOCUMENT: the completed FSR is uploaded as one file (any type) - nothing else is required.
     // LINK (default, also for older clients that send no method): external link (checked by the
     // submit route) + completion checkbox, optional reference number / notes / screenshot.
-    if (getLevitonCompletionMethod(payload) === LEVITON_COMPLETION_METHOD.DOCUMENT) {
-      const documentAssets = payload.fsrDocumentAsset
-        ? await normalizeFsrAssets([payload.fsrDocumentAsset], job._id, userId, 1, { anyFileType: true })
-        : [];
-      if (!documentAssets.length) {
-        throwBadRequest('Upload the FSR document before submitting');
-      }
-
-      return {
-        submissionData: {
-          completionMethod: LEVITON_COMPLETION_METHOD.DOCUMENT,
-          completionConfirmed: true,
-          fsrDocument: documentAssets[0],
-        },
-        assets: documentAssets,
-      };
-    }
-
+    // The DOCUMENT option is handled above for every template.
     const completionConfirmed = ensureBoolean(payload.completionConfirmed, 'Completion');
     if (!completionConfirmed) {
       throwBadRequest('Completion must be checked before submitting the Leviton FSR');
@@ -585,8 +589,9 @@ async function attachAssetUrlsToFsrData(data) {
   const urlByKey = new Map(assets.map((asset) => [asset.key, asset.url]));
   data.assets = assets;
 
-  if (data.templateKey === FSR_TEMPLATE.LEVITON_EXTERNAL && data.submissionData) {
+  if (data.submissionData) {
     const nextSubmission = { ...data.submissionData };
+    // fsrDocument: upload option on any template; screenshot: Leviton link option.
     ['screenshot', 'fsrDocument'].forEach((field) => {
       const asset = nextSubmission[field];
       if (asset?.key) {
@@ -788,6 +793,31 @@ function validateScheduledDate(value) {
   if (normalized < toLocalDateOnly()) {
     throw new Error('Scheduled date cannot be in the past');
   }
+  return true;
+}
+
+function isPastJobFlag(value) {
+  return value === true || value === 'true';
+}
+
+function validateDateOnlyFormat(value) {
+  if (!isDateOnly(normalizeDateOnly(value))) {
+    throw new Error('Invalid date format. Use YYYY-MM-DD');
+  }
+  return true;
+}
+
+/** Regular jobs can't be scheduled in the past; past jobs can't be completed in the future. */
+function jobDateRuleError(dateOnly, isPastJob) {
+  const today = toLocalDateOnly();
+  if (isPastJob) return dateOnly > today ? 'Completion date cannot be in the future' : null;
+  return dateOnly < today ? 'Scheduled date cannot be in the past' : null;
+}
+
+function validateCreateJobDate(value, { req }) {
+  validateDateOnlyFormat(value);
+  const error = jobDateRuleError(normalizeDateOnly(value), isPastJobFlag(req.body.isPastJob));
+  if (error) throw new Error(error);
   return true;
 }
 
@@ -1517,7 +1547,9 @@ router.post(
     body('customerId').notEmpty().withMessage('Customer is required').isMongoId().withMessage('Invalid customer ID'),
     body('jobType').notEmpty().withMessage('Job type is required').isString().withMessage('Job type must be a string'),
     body('programmingSubtype').optional().isString().withMessage('Programming subtype must be a string'),
-    body('scheduledDate').notEmpty().withMessage('Scheduled date is required').custom(validateScheduledDate),
+    body('scheduledDate').notEmpty().withMessage('Scheduled date is required').custom(validateCreateJobDate),
+    body('isPastJob').optional().isBoolean().withMessage('isPastJob must be true or false'),
+    body('technicianId').optional({ values: 'falsy' }).isMongoId().withMessage('Invalid technician ID'),
     body('estimatedCost').optional().isFloat({ min: 0 }).withMessage('Must be a positive number'),
     body('companyName').optional().trim(),
     body('levitonExternalFsrLink').optional().isString().withMessage('External FSR link must be a string'),
@@ -1558,6 +1590,22 @@ router.post(
       } else {
         req.body.programmingSubtype = undefined;
       }
+      req.body.isPastJob = isPastJobFlag(req.body.isPastJob);
+      if (req.body.isPastJob) {
+        if (!req.body.technicianId) {
+          return res.status(400).json({ success: false, error: 'Technician is required for a past job' });
+        }
+        const technician = await User.findById(req.body.technicianId).select('role').lean();
+        if (!technician) {
+          return res.status(404).json({ success: false, error: 'Technician not found' });
+        }
+        if (technician.role !== ROLES.TECHNICIAN) {
+          return res.status(400).json({ success: false, error: 'User is not a technician' });
+        }
+      } else {
+        delete req.body.technicianId;
+      }
+
       await ensureJobTypeSaved(req.body.jobType);
 
       const job = await JobService.createJob(req.body, req.user._id);
@@ -1566,10 +1614,12 @@ router.post(
       });
       await attachFsrSummariesToJobs([job]);
 
-      // Notify admins and managers
+      // Notify admins and managers (technicians are not notified about past jobs)
       createNotification({
         type: 'JOB_CREATED',
-        message: `New job created by ${actorWithRole(req.user)}: "${job.title}" for ${customer.name}`,
+        message: job.isPastJob
+          ? `Past job recorded by ${actorWithRole(req.user)}: "${job.title}" for ${customer.name} (completed ${formatDateOnly(job.scheduledDate)})`
+          : `New job created by ${actorWithRole(req.user)}: "${job.title}" for ${customer.name}`,
         jobId: job._id,
         recipientRoles: [ROLES.ADMIN, ROLES.OFFICE_MANAGER],
         excludeUserId: req.user._id,
@@ -2097,12 +2147,6 @@ router.post(
       }
 
       if (isDocumentUpload) {
-        if (fsrDoc.templateKey !== FSR_TEMPLATE.LEVITON_EXTERNAL) {
-          return res.status(400).json({
-            success: false,
-            error: 'FSR document upload is only available for Leviton FSRs',
-          });
-        }
         if (req.body.files.length !== 1) {
           return res.status(400).json({ success: false, error: 'Upload one FSR document at a time' });
         }
@@ -3634,8 +3678,7 @@ router.patch(
       if (job.scheduledDate) {
         const unavailReason = await JobService.checkTechAvailability(
           req.body.technicianId,
-          job.scheduledDate,
-          job._id
+          job.scheduledDate
         );
         if (unavailReason) {
           const newTech = await User.findById(req.body.technicianId).select('name');
@@ -3647,8 +3690,7 @@ router.patch(
         if (nextSecondaryTechId) {
           const secondaryUnavailReason = await JobService.checkTechAvailability(
             nextSecondaryTechId,
-            job.scheduledDate,
-            job._id
+            job.scheduledDate
           );
           if (secondaryUnavailReason) {
             const secondaryTech = await User.findById(nextSecondaryTechId).select('name');
@@ -4045,7 +4087,8 @@ router.put(
     body('programmingSubtype').optional().isString().withMessage('Programming subtype must be a string'),
     body('levitonExternalFsrLink').optional().isString().withMessage('External FSR link must be a string'),
     body('customerEmail').optional().isEmail().withMessage('Invalid customer email'),
-    body('scheduledDate').optional().custom(validateScheduledDate),
+    // Past-vs-future rule depends on the job's isPastJob flag - checked in the handler.
+    body('scheduledDate').optional().custom(validateDateOnlyFormat),
     body('estimatedCost').optional().isFloat({ min: 0 }).withMessage('Must be positive'),
     body('actualCost').optional().isFloat({ min: 0 }).withMessage('Must be positive'),
     body('siteInfoMode').optional().isIn(['TEXT', 'PDF']).withMessage('Invalid site info mode'),
@@ -4065,6 +4108,16 @@ router.put(
       }
       if (existingJob.status === JOB_STATUS.BILLED) {
         return res.status(400).json({ success: false, error: 'Billed jobs cannot be edited' });
+      }
+
+      if (req.body.scheduledDate !== undefined) {
+        const dateError = jobDateRuleError(
+          normalizeDateOnly(req.body.scheduledDate),
+          Boolean(existingJob.isPastJob)
+        );
+        if (dateError) {
+          return res.status(400).json({ success: false, error: dateError });
+        }
       }
 
       if (req.body.jobType !== undefined) {
@@ -4106,7 +4159,9 @@ router.put(
         delete req.body.levitonExternalFsrLink;
       }
 
-      const result = await JobService.updateJobDetails(req.params.id, req.body);
+      const result = await JobService.updateJobDetails(req.params.id, req.body, {
+        isPastJob: Boolean(existingJob.isPastJob),
+      });
       if (result.error) {
         return res.status(result.status).json({ success: false, error: result.error });
       }

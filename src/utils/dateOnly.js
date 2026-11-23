@@ -25,6 +25,14 @@ function isDateOnly(value) {
   return DATE_ONLY_RE.test(String(value || ''));
 }
 
+/** YYYY-MM-DD → Date at local noon, so the calendar day doesn't shift across time zones. */
+function dateOnlyToLocalNoon(dateOnly) {
+  const normalized = normalizeDateOnly(dateOnly);
+  if (!normalized) return null;
+  const [year, month, day] = normalized.split('-').map(Number);
+  return new Date(year, month - 1, day, 12, 0, 0, 0);
+}
+
 function formatDateOnly(dateOnly, options = { month: 'short', day: 'numeric', year: 'numeric' }) {
   const normalized = normalizeDateOnly(dateOnly);
   if (!normalized) return '';
@@ -38,5 +46,6 @@ module.exports = {
   normalizeDateOnly,
   isDateOnly,
   toLocalDateOnly,
+  dateOnlyToLocalNoon,
   formatDateOnly,
 };

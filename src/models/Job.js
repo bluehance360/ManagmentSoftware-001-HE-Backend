@@ -275,6 +275,14 @@ const jobSchema = new mongoose.Schema(
     completedAt: {
       type: Date,
     },
+    /**
+     * Past job recorded after the fact by Admin / Office Manager.
+     * Created directly as COMPLETED; scheduledDate holds the completion date.
+     */
+    isPastJob: {
+      type: Boolean,
+      default: false,
+    },
     billedAt: {
       type: Date,
     },

@@ -16,7 +16,12 @@ const Customer = require('../models/Customer');
 const JobType = require('../models/JobType');
 const TechTimeout = require('../models/TechTimeout');
 const { ROLES, JOB_STATUS, STATUS_TRANSITIONS, TIMEOUT_REQUEST_STATUS } = require('../config/constants');
-const { normalizeDateOnly, toLocalDateOnly } = require('../utils/dateOnly');
+const {
+  normalizeDateOnly,
+  toLocalDateOnly,
+  dateOnlyToLocalNoon,
+  formatDateOnly,
+} = require('../utils/dateOnly');
 const { getFsrDocumentByJobId, FSR_STATUS } = require('./FsrService');
 
 /**
@@ -57,28 +62,11 @@ async function ensureTechCertifiedForJobType(jobTypeName, technicianIds) {
 
 /**
  * Check if a technician is unavailable on a given date.
+ * Techs can hold any number of jobs at once; only approved time-off on the
+ * job's scheduled day makes them unavailable.
  * Returns a reason string if unavailable, or null if available.
  */
-async function checkTechAvailability(technicianId, scheduledDate, excludeJobId = null) {
-  // 1) Block if the tech already has any active job (ASSIGNED or IN_PROGRESS).
-  // A technician must finish their current job before being assigned a new one.
-  const activeJobQuery = {
-    $or: [
-      { assignedTechnician: technicianId },
-      { secondaryAssignedTechnician: technicianId },
-    ],
-    status: { $in: [JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS] },
-  };
-  if (excludeJobId) {
-    activeJobQuery._id = { $ne: excludeJobId };
-  }
-  const activeJob = await Job.findOne(activeJobQuery).select('title status').lean();
-
-  if (activeJob) {
-    return `Already has an active job: "${activeJob.title}" (${activeJob.status})`;
-  }
-
-  // 2) Check if the tech is on time-off on the target schedule day.
+async function checkTechAvailability(technicianId, scheduledDate) {
   const targetDay = normalizeDateOnly(scheduledDate) || toLocalDateOnly();
 
   const timeout = await TechTimeout.findOne({
@@ -147,6 +135,7 @@ function validateTransition(currentStatus, newStatus, role) {
  */
 async function createJob(data, userId) {
   const normalizedScheduledDate = normalizeDateOnly(data.scheduledDate);
+  const isPastJob = data.isPastJob === true;
   const jobData = {
     title: data.title,
     description: data.description,
@@ -191,6 +180,24 @@ async function createJob(data, userId) {
   if (data.customerEmail) jobData.customerEmail = data.customerEmail;
   if (data.address) jobData.address = data.address;
 
+  // Past job: recorded after the fact, so it skips the pipeline and lands on COMPLETED.
+  // The history entry keeps the real entry time; completedAt carries the backdated day.
+  if (isPastJob) {
+    jobData.isPastJob = true;
+    jobData.status = JOB_STATUS.COMPLETED;
+    jobData.assignedTechnician = data.technicianId;
+    jobData.completedAt = dateOnlyToLocalNoon(normalizedScheduledDate);
+    jobData.statusHistory = [
+      {
+        fromStatus: null,
+        toStatus: JOB_STATUS.COMPLETED,
+        changedBy: userId,
+        technician: data.technicianId,
+        notes: `Recorded as past job - completed on ${formatDateOnly(normalizedScheduledDate)}`,
+      },
+    ];
+  }
+
   const job = await Job.create(jobData);
 
   return Job.populate(job, POPULATE_FIELDS);
@@ -214,11 +221,6 @@ async function transitionStatus(jobId, newStatus, user, notes) {
   // 2) Validate transition + role
   const err = validateTransition(currentStatus, newStatus, user.role);
   if (err) return { error: err, status: 400 };
-
-  // 2b) Notes are required when moving to IN_PROGRESS (tech starting work)
-  if (newStatus === JOB_STATUS.IN_PROGRESS && (!notes || !notes.trim())) {
-    return { error: 'Notes are required when starting a job', status: 400 };
-  }
 
   // 2b2) Incomplete / Return: cannot start work while request is pending or approved (OK again after REJECTED / cleared)
   if (currentStatus === JOB_STATUS.ASSIGNED && newStatus === JOB_STATUS.IN_PROGRESS) {
@@ -274,7 +276,9 @@ async function transitionStatus(jobId, newStatus, user, notes) {
     toStatus: newStatus,
     changedBy: user._id,
     changedAt: new Date(),
-    notes: notes || `Status changed from ${currentStatus} to ${newStatus}`,
+    notes:
+      (typeof notes === 'string' && notes.trim()) ||
+      `Status changed from ${currentStatus} to ${newStatus}`,
   };
 
   // 5) Atomic update - status in filter prevents race condition
@@ -340,9 +344,8 @@ async function assignTechnician(
   const err = validateTransition(JOB_STATUS.CONFIRMED, JOB_STATUS.ASSIGNED, user.role);
   if (err) return { error: err, status: 400 };
 
-  // 2c) Check technician availability:
-  //  - blocks if tech has any active (ASSIGNED/IN_PROGRESS) job
-  //  - blocks if tech is on time-off today
+  // 2c) Check technician availability: blocks only if the tech has approved
+  //     time-off on the job's scheduled date (multiple jobs per tech are fine).
   const unavailReason = await checkTechAvailability(technicianId, jobForSchedule.scheduledDate);
   if (unavailReason) {
     return {
@@ -456,11 +459,23 @@ async function assignTechnician(
 /**
  * Update non-status fields on a job.
  */
-async function updateJobDetails(jobId, data) {
+async function updateJobDetails(jobId, data, { isPastJob = false } = {}) {
   // Strip status-related fields - never allow status changes through this path
-  const { status, statusHistory, assignedTechnician, createdBy, ...safeData } = data;
+  const {
+    status,
+    statusHistory,
+    assignedTechnician,
+    createdBy,
+    isPastJob: _isPastJob,
+    completedAt,
+    ...safeData
+  } = data;
   if (safeData.scheduledDate !== undefined) {
     safeData.scheduledDate = normalizeDateOnly(safeData.scheduledDate);
+    // A past job's scheduled date is its completion date - keep them in sync.
+    if (isPastJob && safeData.scheduledDate) {
+      safeData.completedAt = dateOnlyToLocalNoon(safeData.scheduledDate);
+    }
   }
   if (safeData.jobType !== undefined) {
     safeData.jobType = typeof safeData.jobType === 'string' ? safeData.jobType.trim() : safeData.jobType;
@@ -498,6 +513,11 @@ async function revertStatus(jobId, user) {
   const currentIdx = STATUS_ORDER.indexOf(job.status);
   if (currentIdx <= 0) {
     return { error: 'Cannot revert - job is already at the initial status', status: 400 };
+  }
+  // Past jobs never went through the live pipeline; reverting below COMPLETED
+  // would turn them into an active In Progress job.
+  if (job.isPastJob && job.status === JOB_STATUS.COMPLETED) {
+    return { error: 'Cannot revert - past jobs are recorded as completed', status: 400 };
   }
 
   const previousStatus = STATUS_ORDER[currentIdx - 1];

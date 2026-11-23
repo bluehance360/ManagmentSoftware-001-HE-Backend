@@ -115,21 +115,12 @@ function approvedTimeoutQuery(extra = {}) {
 }
 
 // ── Helper: get unavailable technicians for a date ──────────────────
+// Only approved time-off makes a tech unavailable; having other jobs that day does not.
 async function getUnavailableTechs(date) {
   const day = normalizeDateOnly(date);
   if (!isDateOnly(day)) return [];
 
-  // 1) Techs with active jobs (ASSIGNED or IN_PROGRESS) on this date
-  const activeJobs = await Job.find({
-    status: { $in: [JOB_STATUS.ASSIGNED, JOB_STATUS.IN_PROGRESS] },
-    scheduledDate: day,
-    assignedTechnician: { $ne: null },
-  })
-    .populate('assignedTechnician', 'name email')
-    .select('assignedTechnician title status scheduledDate')
-    .lean();
-
-  // 2) Techs with timeout entries overlapping this date
+  // Techs with timeout entries overlapping this date
   const timeouts = await TechTimeout.find(approvedTimeoutQuery({
     startDate: { $lte: day },
     endDate: { $gte: day },
@@ -139,18 +130,6 @@ async function getUnavailableTechs(date) {
 
   // Build map: techId → { technician, reasons[] }
   const map = {};
-
-  for (const job of activeJobs) {
-    const id = job.assignedTechnician?._id?.toString();
-    if (!id) continue;
-    if (!map[id]) {
-      map[id] = { technician: job.assignedTechnician, reasons: [] };
-    }
-    map[id].reasons.push({
-      type: 'ACTIVE_JOB',
-      detail: `Assigned to "${job.title}" (${job.status})`,
-    });
-  }
 
   for (const t of timeouts) {
     const id = t.technician?._id?.toString();
