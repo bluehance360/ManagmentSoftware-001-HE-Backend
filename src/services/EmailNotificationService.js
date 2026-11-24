@@ -38,6 +38,19 @@ const EMAIL_EVENT_LABELS = {
   JOB_STARTED_DOCS_PENDING: 'Job Started - Documents Pending',
   JOB_FSR_REMINDER_TECH: 'FSR Pending Reminder',
   JOB_FSR_REMINDER_ADMIN: 'FSR Pending Reminder',
+  JOB_RECEIPT_SUBMITTED: 'Receipt Submitted',
+  JOB_RECEIPT_APPROVED: 'Receipt Approved',
+  JOB_RECEIPT_REJECTED: 'Receipt Rejected',
+  JOB_RECEIPT_REIMBURSED: 'Receipt Reimbursed',
+};
+
+// Receipt emails lead with "Receipt <action> for <job>" and their button opens the job's
+// Receipts tab instead of the job overview.
+const RECEIPT_EMAIL_HEADINGS = {
+  JOB_RECEIPT_SUBMITTED: 'Receipt submitted for',
+  JOB_RECEIPT_APPROVED: 'Receipt approved for',
+  JOB_RECEIPT_REJECTED: 'Receipt rejected for',
+  JOB_RECEIPT_REIMBURSED: 'Receipt reimbursed for',
 };
 
 // For these types, only the explicitly targeted users (recipientIds) are
@@ -123,6 +136,15 @@ async function sendJobEventEmailsInner(recipientIds, { type, message, jobId, met
     }
     const details = buildJobDetails(job);
     const subjectSuffix = job?.title || meta?.jobTitle || undefined;
+    const receiptHeading = RECEIPT_EMAIL_HEADINGS[type];
+    const receiptEmail = receiptHeading
+      ? {
+          heading: subjectSuffix ? `${receiptHeading} ${subjectSuffix}` : eventLabel,
+          subject: subjectSuffix ? `${receiptHeading} ${subjectSuffix}` : eventLabel,
+          buttonLabel: 'View Receipt',
+          tab: 'receipts',
+        }
+      : {};
     const results = await Promise.allSettled(
       users.map((user) =>
         sendJobEventEmail({
@@ -133,6 +155,7 @@ async function sendJobEventEmailsInner(recipientIds, { type, message, jobId, met
           details,
           jobId: jobId ? String(jobId) : null,
           subjectSuffix,
+          ...receiptEmail,
         })
       )
     );

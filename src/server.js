@@ -7,6 +7,7 @@ const { initSocket } = require('./socket');
 const notificationScheduler = require('./services/SchedulerService');
 const authRoutes = require('./routes/auth');
 const jobRoutes = require('./routes/jobs');
+const receiptRoutes = require('./routes/receipts');
 const userRoutes = require('./routes/users');
 const notificationRoutes = require('./routes/notifications');
 const invitationRoutes = require('./routes/invitations');
@@ -40,6 +41,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // Routes
 app.use('/api/auth', authRoutes);
+app.use('/api/jobs/:id/receipts', receiptRoutes);
 app.use('/api/jobs', jobRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/notifications', notificationRoutes);

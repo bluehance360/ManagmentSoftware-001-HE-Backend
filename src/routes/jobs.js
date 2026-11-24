@@ -50,6 +50,8 @@ const {
   cancelPendingSignatureRequest,
   cancelPendingSignatureRequestsForFsr,
 } = require('../services/FsrSignatureRequestService');
+const { canAccessJob, actorWithRole } = require('../utils/jobAccess');
+const { getReceiptSummaryForJob, deleteReceiptsForJob } = require('../services/ReceiptService');
 
 const router = express.Router();
 
@@ -58,21 +60,22 @@ function broadcastJobUpdate() {
   if (io) io.emit('jobs:updated');
 }
 
-const TECH_VISIBLE_STATUSES = [
-  JOB_STATUS.ASSIGNED,
-  JOB_STATUS.IN_PROGRESS,
-  JOB_STATUS.COMPLETED,
-  JOB_STATUS.BILLED,
-  JOB_STATUS.PAID,
-  JOB_STATUS.CLOSED,
-];
-
 const PROGRAMMING_SUBTYPES = ['New Start-Up', 'Existing Start-Up'];
 const EMPTY_PROGRAMMING_REQUIREMENT_DEFAULTS = {
   newStartup: [],
   existingStartup: [],
 };
-const FSR_IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'heic', 'heif']);
+/** FSR photo types, with the type to store when the browser doesn't report one (often HEIC/AVIF). */
+const FSR_IMAGE_MIME_BY_EXT = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  heic: 'image/heic',
+  heif: 'image/heif',
+  avif: 'image/avif',
+};
+const FSR_IMAGE_EXTENSIONS = new Set(Object.keys(FSR_IMAGE_MIME_BY_EXT));
 const FSR_MAX_ASSETS = 10;
 /** Presign purpose for the completed FSR uploaded as a single file of any type (all templates). */
 const FSR_ASSET_PURPOSE_DOCUMENT = 'FSR_DOCUMENT';
@@ -748,39 +751,6 @@ function withJobDetailPopulate(query) {
   return query.populate(JOB_DETAIL_POPULATE);
 }
 
-function canAccessJob(user, job) {
-  if (!job) return false;
-  if ([ROLES.ADMIN, ROLES.OFFICE_MANAGER].includes(user.role)) return true;
-  if (user.role !== ROLES.TECHNICIAN) return false;
-
-  const userId = user._id.toString();
-  const primaryTechId = job.assignedTechnician?._id || job.assignedTechnician;
-  const secondaryTechId = job.secondaryAssignedTechnician?._id || job.secondaryAssignedTechnician;
-  const selfAssigned =
-    primaryTechId?.toString() === userId || secondaryTechId?.toString() === userId;
-
-  if (selfAssigned && TECH_VISIBLE_STATUSES.includes(job.status)) return true;
-
-  const extendedReturnStatuses = [
-    JOB_STATUS.TENTATIVE,
-    JOB_STATUS.CONFIRMED,
-    ...TECH_VISIBLE_STATUSES,
-  ];
-  if (
-    job.jobVisitKind === 'RETURN' &&
-    job.parentJob &&
-    extendedReturnStatuses.includes(job.status)
-  ) {
-    const parent = job.parentJob;
-    const p1 = parent.assignedTechnician?._id || parent.assignedTechnician;
-    const p2 = parent.secondaryAssignedTechnician?._id || parent.secondaryAssignedTechnician;
-    const parentAssigned = p1?.toString() === userId || p2?.toString() === userId;
-    if (parentAssigned) return true;
-  }
-
-  return false;
-}
-
 function normalizeDocNote(note) {
   return typeof note === 'string' ? note.trim() : '';
 }
@@ -819,16 +789,6 @@ function validateCreateJobDate(value, { req }) {
   const error = jobDateRuleError(normalizeDateOnly(value), isPastJobFlag(req.body.isPastJob));
   if (error) throw new Error(error);
   return true;
-}
-
-function formatRoleLabel(role) {
-  if (!role) return 'User';
-  if (role === ROLES.OFFICE_MANAGER) return 'Office Manager';
-  return role.charAt(0).toUpperCase() + role.slice(1).toLowerCase();
-}
-
-function actorWithRole(user) {
-  return `${user.name} (${formatRoleLabel(user.role)})`;
 }
 
 function hasAssignedTechnician(job) {
@@ -1521,6 +1481,7 @@ router.get('/:id', async (req, res) => {
     data.returnVisitJobs = returnVisitJobs;
     const fsrDoc = await getFsrDocumentByJobId(job._id);
     data.fsrSummary = fsrDoc ? formatFsrDocument(fsrDoc).summary : null;
+    data.receiptSummary = await getReceiptSummaryForJob(job);
 
     // Opening the job marks it "seen" for managers (clears the unseen indicator).
     if (isManagerRole(req.user.role)) {
@@ -2163,14 +2124,21 @@ router.post(
       if (invalid) {
         return res.status(400).json({
           success: false,
-          error: `File type not allowed: "${invalid.name}". Accepted: PNG, JPG, JPEG, WEBP, HEIC, HEIF`,
+          error: `File type not allowed: "${invalid.name}". Accepted: PNG, JPG, JPEG, WEBP, HEIC, HEIF, AVIF`,
         });
       }
 
       const uploads = await Promise.all(
         files.map(async (file) => {
           const key = buildFsrAssetKey(job._id.toString(), file.name);
-          const contentType = file.contentType || 'application/octet-stream';
+          // Photos must be stored as image/* (checked again on submit), so fill in the type from
+          // the extension when the browser sent none.
+          const reportedType =
+            file.contentType && file.contentType !== 'application/octet-stream' ? file.contentType : '';
+          const extType = isDocumentUpload
+            ? ''
+            : FSR_IMAGE_MIME_BY_EXT[String(file.name || '').split('.').pop().toLowerCase()];
+          const contentType = reportedType || extType || 'application/octet-stream';
           const presignedUrl = await getUploadUrl({ key, contentType, expiresIn: 300 });
           return {
             key,
@@ -4040,6 +4008,9 @@ router.delete(
       if (fsrDoc) {
         await fsrDoc.deleteOne();
       }
+      await deleteReceiptsForJob(job._id).catch((err) =>
+        console.error('Failed to delete receipts for deleted job:', err.message)
+      );
 
       // Notify relevant people based on job visibility
       const notifRecipientIds = [];

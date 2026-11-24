@@ -403,9 +403,29 @@ async function sendFsrSignatureRequestEmail({
  * @param {string|null} [opts.jobId]  - Job id for the deep link (null → plain /jobs link)
  * @param {string} [opts.subjectSuffix] - Appended to the subject (usually the job title)
  */
-async function sendJobEventEmail({ to, recipientName, eventLabel, message, details, jobId, subjectSuffix }) {
+/**
+ * Job notification email. Optional overrides (all default to the generic job email):
+ *   heading     - main title (default: eventLabel)
+ *   subject     - full subject line (default: "eventLabel: subjectSuffix")
+ *   buttonLabel - call-to-action text (default: "View Job")
+ *   tab         - job panel tab the button opens, e.g. 'receipts'
+ */
+async function sendJobEventEmail({
+  to,
+  recipientName,
+  eventLabel,
+  message,
+  details,
+  jobId,
+  subjectSuffix,
+  heading,
+  subject,
+  buttonLabel,
+  tab,
+}) {
   const frontendUrl = getFrontendUrl();
-  const jobUrl = jobId ? `${frontendUrl}/jobs?openJob=${jobId}` : `${frontendUrl}/jobs`;
+  const tabQuery = jobId && tab ? `&tab=${encodeURIComponent(tab)}` : '';
+  const jobUrl = jobId ? `${frontendUrl}/jobs?openJob=${jobId}${tabQuery}` : `${frontendUrl}/jobs`;
 
   const rows = (details || []).filter(([, value]) => String(value || '').trim());
   const rowsHtml = rows
@@ -434,7 +454,7 @@ async function sendJobEventEmail({ to, recipientName, eventLabel, message, detai
         </tr>
         <tr>
           <td style="padding:32px;">
-            <h2 style="margin:0 0 8px;color:#1a1a1a;font-size:18px;">${escapeHtml(eventLabel)}</h2>
+            <h2 style="margin:0 0 8px;color:#1a1a1a;font-size:18px;">${escapeHtml(heading || eventLabel)}</h2>
             ${recipientName ? `<p style="margin:0 0 12px;color:#6b7280;font-size:14px;line-height:1.6;">Hi <strong>${escapeHtml(recipientName)}</strong>,</p>` : ''}
             <p style="margin:0 0 20px;color:#6b7280;font-size:14px;line-height:1.6;">${escapeHtml(message)}</p>
             ${rowsHtml ? `
@@ -445,7 +465,7 @@ async function sendJobEventEmail({ to, recipientName, eventLabel, message, detai
               <tr><td align="center">
                 <a href="${jobUrl}" target="_blank"
                    style="display:inline-block;padding:14px 32px;background-color:#C41E2A;color:#ffffff;text-decoration:none;font-size:15px;font-weight:600;border-radius:8px;">
-                  ${jobId ? 'View Job' : 'Open Jobs'}
+                  ${escapeHtml(jobId ? buttonLabel || 'View Job' : 'Open Jobs')}
                 </a>
               </td></tr>
             </table>
@@ -468,7 +488,7 @@ async function sendJobEventEmail({ to, recipientName, eventLabel, message, detai
   await transporter.sendMail({
     from: `"${process.env.SMTP_FROM_NAME || 'Hosanna Electric'}" <${process.env.SMTP_FROM_EMAIL || 'noreply@example.com'}>`,
     to,
-    subject: subjectSuffix ? `${eventLabel}: ${subjectSuffix}` : eventLabel,
+    subject: subject || (subjectSuffix ? `${eventLabel}: ${subjectSuffix}` : eventLabel),
     html,
   });
 }

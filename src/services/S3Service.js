@@ -42,6 +42,12 @@ const MIME_BY_EXT = {
   jpeg: 'image/jpeg',
   gif: 'image/gif',
   webp: 'image/webp',
+  avif: 'image/avif',
+  heic: 'image/heic',
+  heif: 'image/heif',
+  bmp: 'image/bmp',
+  tif: 'image/tiff',
+  tiff: 'image/tiff',
   svg: 'image/svg+xml',
   txt: 'text/plain; charset=utf-8',
   csv: 'text/csv; charset=utf-8',
@@ -65,6 +71,13 @@ function buildFsrAssetKey(jobId, originalName) {
   const stamp = Date.now();
   const rand = Math.random().toString(36).slice(2, 10);
   return `jobs/${jobId}/fsr/${stamp}-${rand}-${safeName}`;
+}
+
+function buildReceiptKey(jobId, originalName) {
+  const safeName = sanitizeFileName(originalName);
+  const stamp = Date.now();
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `jobs/${jobId}/receipts/${stamp}-${rand}-${safeName}`;
 }
 
 async function getUploadUrl({ key, contentType, expiresIn = 300 }) {
@@ -107,6 +120,7 @@ module.exports = {
   sanitizeFileName,
   buildDocumentKey,
   buildFsrAssetKey,
+  buildReceiptKey,
   getUploadUrl,
   getDownloadUrl,
   headObject,
